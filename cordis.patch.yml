@@ -1,0 +1,24 @@
+# Cordis patch layer for Hindsight memory in DeepSeek Harness.
+#
+# A profile that installs this package — `dsh plugin --profile <name> add hindsight-dsh`, or the
+# sidebar's Plugins page — picks this file up through the `dsh.bundle.patch` declaration in
+# package.json, so nothing else needs editing.
+#
+# The entry id is load-bearing twice over: it names the Loader row, and it IS the settings namespace
+# the plugin's own page reads and writes (Settings -> Hindsight). Rename it here and the page must be
+# renamed with it.
+#
+# `name` must be the BARE package specifier, with no subpath. The client module system locates a
+# row's manifest by resolving the specifier and reading the nearest package.json whose `name` matches,
+# and its parser accepts only `<pkg>` or `@scope/<pkg>`: a row named `hindsight-dsh/dsh` resolves the
+# host half fine, then yields no package name, so the browser half is silently never served and the
+# settings page never appears. `package-contract.test.ts` fails the build if this drifts.
+#
+# To switch memory off for one profile without uninstalling, override the row in that profile's own
+# cordis.patch.yml:
+#
+#   - id: hindsight
+#     disabled: true
+- insert:
+    - id: hindsight
+      name: "hindsight-dsh"

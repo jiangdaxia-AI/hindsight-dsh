@@ -1,0 +1,6 @@
+node_modules/
+# Build artifacts: `files` ships them, `prepublishOnly` (re)builds them, and CI asserts both exist
+# after a build. Committing them would let a stale bundle ship from a clean checkout.
+dist/
+lib/
+*.log

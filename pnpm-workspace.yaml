@@ -1,0 +1,8 @@
+# pnpm workspace settings.
+#
+# `esbuild` is the only dependency with an install script. It needs the allowance because it stages
+# its platform binary (@esbuild/<os>-<arch>) behind a postinstall check, and pnpm blocks install
+# scripts by default. Its script is the vendor's own and runs at build time only — nothing here ships
+# to a user, since the published package has no dependencies at all.
+allowBuilds:
+  esbuild: true

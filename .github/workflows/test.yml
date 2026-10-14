@@ -1,0 +1,71 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: pnpm/action-setup@v4
+      with:
+        version: '11'
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+        cache: pnpm
+        cache-dependency-path: pnpm-lock.yaml
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    # Before anything is built: prove the vendored runtime is the copy this repo pinned, and that
+    # its import boundary is still closed. A hand-edited or half-synced vendor tree otherwise fails
+    # later as a confusing typecheck or bundling error.
+    - name: Check the vendored runtime
+      run: pnpm run check-runtime
+
+    - name: Typecheck
+      run: pnpm run typecheck
+
+    - name: Unit tests
+      run: pnpm test
+
+    - name: Build both halves
+      run: pnpm run build
+
+    # The build already refuses to emit a bundle whose packages are undeclared (see
+    # scripts/build.mjs). This is the packaging contract on top: everything the manifest tells a
+    # profile to load has to be in the tarball that `files` would publish.
+    - name: Contract check against a real dsh profile
+      run: |
+        node -e "
+        const { existsSync, readFileSync } = require('node:fs');
+        const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+        const fail = (m) => { throw new Error(m) };
+
+        const required = [
+          'dist/host.js',
+          pkg.dsh?.bundle?.patch?.replace(/^\.\//, '') ?? fail('dsh.bundle.patch is missing'),
+          pkg.exports?.['./client']?.replace(/^\.\//, '') ?? fail('exports[\"./client\"] is missing'),
+        ];
+        for (const file of required) {
+          if (!existsSync(file)) fail('missing build artifact: ' + file);
+        }
+
+        // `files` is what npm would actually publish; the entries above must be inside it.
+        const shipped = pkg.files ?? [];
+        for (const file of required) {
+          const top = file.split('/')[0];
+          if (!shipped.includes(top)) fail('files does not ship ' + top + ' (needed for ' + file + ')');
+        }
+        console.log('contract OK:', required.join(', '));
+        "

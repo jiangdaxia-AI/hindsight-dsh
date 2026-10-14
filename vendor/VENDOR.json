@@ -1,0 +1,10 @@
+{
+  "upstream": {
+    "package": "@vectorize-io/hindsight-coding-agents",
+    "version": "0.8.1",
+    "commit": "92ec5dfd6d474508e1839a1f8aedc30388f7d0c0"
+  },
+  "fileCount": 73,
+  "inventory": "6fae5713b784159666fdbde0ad49f4724a24829cf5d0307d15342a0282a01fe1",
+  "syncedAt": "2026-10-14T09:28:53.688Z"
+}
