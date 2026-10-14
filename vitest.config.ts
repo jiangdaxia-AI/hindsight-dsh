@@ -13,7 +13,9 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["src/**/*.test.ts"],
+    // `src` is the plugin; `scripts` holds the vendoring guard, whose failure modes are silent
+    // enough that it needs its own tests (see scripts/sync-runtime.test.mjs).
+    include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
     environment: "node",
   },
 });

@@ -44,28 +44,7 @@ jobs:
 
     # The build already refuses to emit a bundle whose packages are undeclared (see
     # scripts/build.mjs). This is the packaging contract on top: everything the manifest tells a
-    # profile to load has to be in the tarball that `files` would publish.
+    # profile to load has to exist, be inside `files`, and be reachable by the runtime — including
+    # the entries it spawns by path, which no import graph would reveal.
     - name: Contract check against a real dsh profile
-      run: |
-        node -e "
-        const { existsSync, readFileSync } = require('node:fs');
-        const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-        const fail = (m) => { throw new Error(m) };
-
-        const required = [
-          'dist/host.js',
-          pkg.dsh?.bundle?.patch?.replace(/^\.\//, '') ?? fail('dsh.bundle.patch is missing'),
-          pkg.exports?.['./client']?.replace(/^\.\//, '') ?? fail('exports[\"./client\"] is missing'),
-        ];
-        for (const file of required) {
-          if (!existsSync(file)) fail('missing build artifact: ' + file);
-        }
-
-        // `files` is what npm would actually publish; the entries above must be inside it.
-        const shipped = pkg.files ?? [];
-        for (const file of required) {
-          const top = file.split('/')[0];
-          if (!shipped.includes(top)) fail('files does not ship ' + top + ' (needed for ' + file + ')');
-        }
-        console.log('contract OK:', required.join(', '));
-        "
+      run: pnpm run check-contract

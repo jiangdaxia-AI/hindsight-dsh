@@ -47,6 +47,7 @@
     "build": "node scripts/build.mjs",
     "sync-runtime": "node scripts/sync-runtime.mjs",
     "check-runtime": "node scripts/sync-runtime.mjs --check",
+    "check-contract": "node scripts/check-contract.mjs",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

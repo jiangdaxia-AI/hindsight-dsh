@@ -161,10 +161,10 @@ and `setRuntimeConfigSource`) is shared with the other harnesses.
 
 ## Vendored runtime
 
-`vendor/coding-agents/` is a pinned copy of the shared coding-agent runtime — 73 files, taken from
-`hindsight-integrations/coding-agents`, and the only thing `dist/host.js` is built from. Upstream is
-the single source of truth for the code; this repository is the single source of truth for what it
-builds against.
+`vendor/coding-agents/` is a pinned copy of the shared coding-agent runtime — 73 source files plus a
+generated `package.json`, taken from `hindsight-integrations/coding-agents`, and the only thing
+`dist/host.js` is built from. Upstream is the single source of truth for the code; this repository is
+the single source of truth for what it builds against.
 
 It is a copy rather than a dependency for a reason. The runtime is *bundled*, not resolved: an install
 must be a link and a copy, with nothing for a profile's module system to look up, and no version of a
@@ -179,31 +179,39 @@ pnpm run check-runtime                           # verify the copy; no checkout 
 ```
 
 `sync-runtime` copies the file set, regenerates `vendor/coding-agents/package.json` (the runtime reads
-its `version` for the `User-Agent` it sends the server), and writes `vendor/VENDOR.json` — the upstream
-package, version and commit, plus a content hash of every vendored file. CI runs `check-runtime` with
-no checkout available, so a hand-edited or half-synced vendor tree fails there instead of surfacing
-later as a puzzling typecheck or bundling error.
+its `version` for the `User-Agent` it sends the server), and writes `vendor/VENDOR.json`: the upstream
+package, version and commit, plus a content hash of **everything under `vendor/coding-agents/`** —
+sources and the generated manifest alike, since an edit to either changes what this package claims to
+be. Re-syncing an unchanged upstream rewrites nothing, so a no-op sync stays a no-op in `git status`.
+CI runs `check-runtime` with no checkout available, so a hand-edited or half-synced tree fails there
+instead of surfacing later as a puzzling typecheck or bundling error.
 
-Two invariants are enforced, because both fail silently otherwise:
+Three invariants are enforced, because each fails silently otherwise:
 
-- **The set is closed.** No vendored file may import anything outside it. If upstream grows an import
-  from `core/` into a file this package does not carry, the sync refuses to write a broken tree and
-  names the file — rather than letting the breakage appear here days later as this package's bug.
+- **The set is closed.** No vendored file may import anything outside it. The boundary is proved
+  against the upstream text *before* a byte is written, so a sync that would produce a broken tree
+  leaves the working tree exactly as it found it, and names the offending file.
 - **Every package the bundle needs is declared.** `scripts/build.mjs` reads its own resolved import
   graph and fails if the runtime reaches for a package `package.json` does not list. That is what
   makes a re-sync tell you exactly what to add, instead of failing at a user's first prompt.
+- **Everything the runtime reaches for by path is built.** Four of the bundled entries are never
+  imported — the runtime spawns them as siblings by `dirname(import.meta.url)`, usually with stdio
+  ignored, so a missing one is a feature that silently never happens rather than an error.
+  `pnpm run check-contract` reads the vendored source for that pattern and fails if a spawn target is
+  not one of the build's entries, which is how an upstream addition announces itself.
 
 Vendoring is deliberately *not* in the published tarball: `files` ships only the built bundles, so
-these sources exist for maintainers and CI, not for users.
+these sources exist for maintainers and CI, not for users. `check-contract` asserts that too.
 
 ## Development
 
 ```sh
 pnpm install
-pnpm run build          # dist/host.js (host, self-contained) + lib/client.js (browser, loader envelope)
-pnpm test               # unit tests; no dsh needed
+pnpm run build           # dist/host.js (host, self-contained) + lib/client.js (browser, loader envelope)
+pnpm test                # unit tests; no dsh needed
 pnpm run typecheck
-pnpm run check-runtime  # the vendored runtime still matches vendor/VENDOR.json
+pnpm run check-runtime   # the vendored runtime still matches vendor/VENDOR.json
+pnpm run check-contract  # after a build: the manifest, the artifacts and `files` agree
 ```
 
 **If `pnpm test` dies with `Cannot find native binding`** — a `rolldown` error naming
