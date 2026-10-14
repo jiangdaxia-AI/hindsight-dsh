@@ -1,4 +1,4 @@
-# pnpm workspace settings.
+# pnpm settings.
 #
 # `esbuild` is the only dependency with an install script. It needs the allowance because it stages
 # its platform binary (@esbuild/<os>-<arch>) behind a postinstall check, and pnpm blocks install
@@ -6,3 +6,25 @@
 # to a user, since the published package has no dependencies at all.
 allowBuilds:
   esbuild: true
+
+# Security pins on transitive dependencies, carried over from the manifests this package was
+# extracted out of (`hindsight`'s root and `hindsight-integrations/coding-agents`), which had added
+# them deliberately. Nothing inlined at build time declares these — they arrive under
+# @modelcontextprotocol/sdk — so without a pin a future update is free to walk them back to a
+# version a CVE was raised against, and nothing here would notice.
+#
+# THEY BELONG HERE, NOT IN `package.json`. pnpm 11 ignores `overrides` in package.json in this
+# layout; an `overrides` block there is inert, which is worse than absent because it reads like a
+# guard. `pnpm-workspace.yaml` is the file pnpm reads, and the only one where these get recorded in
+# pnpm-lock.yaml and therefore enforced by `--frozen-lockfile`.
+#
+# Only the pins that apply to THIS dependency tree are here. `vite: >=6.4.3 <7` and the pins for
+# packages absent from this tree (the docs site's and the control plane's) are deliberately not:
+# `vite` is 8.x here, pulled by vitest 4, so that pin would break the test runner rather than
+# protect it.
+overrides:
+  fast-uri: '>=3.1.6 <4'
+  hono: '>=4.13.5 <5.0.0'
+  ip-address: '>=10.5.1 <11.0.0'
+  # `ajv` reaches this tree through `ajv-formats`; pinning the parent alone would not reach it.
+  ajv: '^8.18.0'
