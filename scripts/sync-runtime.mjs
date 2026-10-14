@@ -15,8 +15,9 @@
  *   node scripts/sync-runtime.mjs --check                      # fail if the copy was hand-edited
  *
  * `--check` never needs a checkout: it verifies the pinned inventory and the boundary below. Given
- * `--from` it additionally proves the copy is byte-identical to that upstream revision, which is
- * how a maintainer confirms a sync actually took.
+ * `--from` it additionally compares the copy against that upstream revision IN BOTH DIRECTIONS —
+ * every file we carry must match, and every file upstream has must be carried — which is how a
+ * maintainer confirms a sync actually took, or discovers that one is due.
  *
  * WHAT IS COPIED — and why the boundary is stable. The set below is closed: no vendored file
  * imports anything outside it. The script proves that BEFORE it writes a single byte, against the
@@ -87,13 +88,13 @@ const COPY_FILES = [
 ];
 
 /**
- * Generated files that live OUTSIDE `src/`, keyed by their path relative to `src/`.
+ * Generated files that live OUTSIDE `src/`.
  *
- * `core/hindsight.ts` imports `../../package.json`; from inside `core/` that resolves to
- * `../package.json` relative to `src/`. Leading `../` segments are stripped before the lookup, so
- * the entry stays correct if a future vendored file sits one level deeper.
+ * `core/hindsight.ts` imports `../../package.json`, which resolves to `vendor/coding-agents/
+ * package.json`. The boundary check recognises it by comparing RESOLVED PATHS against
+ * `VENDOR_PKG_JSON` rather than by matching a name here, because a name match cannot tell the real
+ * target from a specifier of the wrong depth that resolves to nothing.
  */
-const GENERATED_FILES = new Set(["package.json"]);
 
 function toPosix(path) {
   return path.split(sep).join("/");
@@ -199,7 +200,17 @@ function resolveUpstream(explicit) {
   ].filter(Boolean);
   for (const candidate of candidates) {
     const dir = resolve(candidate);
-    if (existsSync(join(dir, UPSTREAM_SUBDIR, "src", "dsh.ts"))) return dir;
+    if (!existsSync(join(dir, UPSTREAM_SUBDIR, "src", "dsh.ts"))) continue;
+    // The checkout must also carry the manifest: it supplies both the version baked into the
+    // vendored package.json and the User-Agent the runtime sends. Caught here so a partial
+    // checkout is a clear refusal, not an ENOENT from deep inside the copy loop.
+    if (!existsSync(upstreamPkgPath(dir))) {
+      fail(
+        `${dir} has ${UPSTREAM_SUBDIR}/src/dsh.ts but no ${UPSTREAM_SUBDIR}/package.json — ` +
+          `the vendored manifest is generated from it, so the checkout is incomplete`,
+      );
+    }
+    return dir;
   }
   fail(
     `could not find a hindsight checkout — pass --from <path> or set HINDSIGHT_REPO.\n` +
@@ -250,14 +261,26 @@ function findEscapingImports(files, readSource) {
       const spec = match[1];
       if (resolveSpecifier(dir, spec, files) !== undefined) continue;
 
-      // The one legitimate target outside `src/`: the generated package.json, accepted only when
-      // the file is really there.
-      const target = toPosix(join(dir, spec));
-      if (GENERATED_FILES.has(target.replace(/^(\.\.\/)+/, "")) && existsSync(VENDOR_PKG_JSON)) {
+      // The one legitimate target outside `src/`: the generated package.json that
+      // `core/hindsight.ts` reads for its version.
+      //
+      // Compared as a RESOLVED PATH, not as a normalised string. `join` collapses
+      // `core/../package.json` to `package.json`, which made a specifier that actually points at
+      // the non-existent `src/package.json` look identical to the real `core/../../package.json`.
+      // Resolving against the filesystem keeps the two apart, and lets a genuinely missing
+      // generated file say so instead of blaming the reader with "add it to COPY_FILES".
+      if (resolve(VENDOR_SRC, dir, spec) === VENDOR_PKG_JSON) {
+        if (!existsSync(VENDOR_PKG_JSON)) {
+          problems.push(
+            `src/${rel} imports "${spec}", which is generated (vendor/coding-agents/package.json) ` +
+              `but is MISSING — re-run the sync with --from <hindsight checkout>`,
+          );
+        }
         continue;
       }
 
-      const real = existsSync(join(VENDOR_SRC, ...target.split("/")));
+      const target = resolve(VENDOR_SRC, dir, spec);
+      const real = existsSync(target);
       problems.push(
         real
           ? `src/${rel} imports "${spec}", which is real but OUTSIDE the vendored set`
@@ -382,6 +405,8 @@ if (!check) {
 
   if (fromArg) {
     const upstream = resolveUpstream(fromArg);
+
+    // Every file we carry must still be there upstream, and match it byte for byte.
     for (const rel of [...files].sort()) {
       const a = join(upstreamSrc(upstream), ...rel.split("/"));
       if (!existsSync(a)) {
@@ -393,8 +418,22 @@ if (!check) {
         problems.push(`src/${rel} differs from upstream`);
       }
     }
-    if (JSON.parse(readFileSync(VENDOR_PKG_JSON, "utf8")).version !==
-        JSON.parse(readFileSync(upstreamPkgPath(upstream), "utf8")).version) {
+
+    // The comparison has to run the other way too. Every file above is named by the VENDORED tree,
+    // so a copy that is merely BEHIND — upstream added a file this package never took — reported
+    // OK, which is exactly the case `--from` exists to catch.
+    for (const rel of [...upstreamFileSet(upstream)].sort()) {
+      if (!files.has(rel)) {
+        problems.push(`src/${rel} exists upstream but is NOT vendored — run the sync`);
+      }
+    }
+
+    if (!existsSync(VENDOR_PKG_JSON)) {
+      problems.push("vendor/coding-agents/package.json is missing — run the sync");
+    } else if (
+      JSON.parse(readFileSync(VENDOR_PKG_JSON, "utf8")).version !==
+      JSON.parse(readFileSync(upstreamPkgPath(upstream), "utf8")).version
+    ) {
       problems.push("vendor/coding-agents/package.json does not carry the upstream version");
     }
   }

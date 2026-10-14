@@ -183,8 +183,21 @@ its `version` for the `User-Agent` it sends the server), and writes `vendor/VEND
 package, version and commit, plus a content hash of **everything under `vendor/coding-agents/`** —
 sources and the generated manifest alike, since an edit to either changes what this package claims to
 be. Re-syncing an unchanged upstream rewrites nothing, so a no-op sync stays a no-op in `git status`.
-CI runs `check-runtime` with no checkout available, so a hand-edited or half-synced tree fails there
-instead of surfacing later as a puzzling typecheck or bundling error.
+
+What each mode can see, which is not the same thing:
+
+| | no checkout (CI) | `--from <checkout>` |
+|---|---|---|
+| A hand-edited, added or removed vendored file | ✅ against the pinned hash | ✅ |
+| An import escaping the vendored set | ✅ | ✅ |
+| A vendored file that drifted from upstream | — | ✅ |
+| **A file upstream added that was never vendored** | — | ✅ |
+
+The last row is the one worth understanding: without a checkout there is nothing to compare against,
+so a copy that is merely *behind* is indistinguishable from one that is current. CI cannot see it;
+`pnpm run check-runtime --from ../hindsight` can, and says `exists upstream but is NOT vendored`.
+Run that before a release. The comparison is deliberately two-way, because a check that only walks
+the files you already have reports OK on exactly the case a sync exists to fix.
 
 Three invariants are enforced, because each fails silently otherwise:
 
