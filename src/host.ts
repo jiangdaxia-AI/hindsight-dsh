@@ -45,7 +45,7 @@ import { DEFAULT_SETTINGS, NAMESPACE, type DshSettings } from "./fields";
 import { HARNESS } from "./harness";
 import { createInspectApi, type InspectDeps } from "./inspect";
 import { Config, toRuntimeConfig } from "./settings";
-import { applyDaemonLlmEnv } from "./daemon-llm";
+import { applyDaemonLlmEnv, ensureDaemonProcessEnv, installDaemonLlmEnv } from "./daemon-llm";
 import { ensureUvOnPath } from "./uv";
 import {
   harnessFacts,
@@ -284,6 +284,47 @@ export function apply(ctx: HostContext, config?: unknown): void {
     };
 
     /**
+     * Keep this process's daemon model in step with the page, so EVERY spawn path agrees.
+     *
+     * The one-click setup applies the model to the environment only when the page asks for a run —
+     * so a daemon restarted by a hook, by the plugin reloading, or by hand re-read the profile's
+     * `.env` and came back on whatever model was persisted there, silently unpicking the page's
+     * choice (2026-10-15: a daemon restarted outside the page came back on an old gateway/model
+     * pick while the page showed the local one). Installing the resolved choice into this
+     * process's environment closes that: the runtime's `daemonEnv` forwards `HINDSIGHT_API_*` from
+     * the environment to the starter, and the starter persists them to the profile — so whichever
+     * process starts the daemon next, it starts on the same model.
+     *
+     * The resolution is the setup's own precedence (the page's pick, then dsh's own model) through
+     * the same seams, and `installDaemonLlmEnv` restores what a previous install borrowed, so a
+     * CLEARED pick unpins the retired model instead of leaving it standing. `modelFromExplicitEnv`
+     * is deliberately absent here: an exported `HINDSIGHT_API_LLM_PROVIDER` is already in the
+     * environment and needs no help from us.
+     *
+     * Fire-and-forget: a volatile write cannot wait on `credentials.resolve`, and the first
+     * session's hooks arrive long after one resolution lands. If a hook wins the race, the daemon
+     * starts exactly as it would have without this — on the profile's own configuration — and the
+     * next refresh installs the choice for the spawn after it.
+     */
+    const refreshDaemonModelEnv = (): void => {
+      void (async () => {
+        try {
+          await ensureDaemonProcessEnv();
+        } catch {
+          /* the daemon keeps whatever spawn environment it already had */
+        }
+        try {
+          const model =
+            (await modelFromChoice(readSettings(config), harnessFactsHere())) ?? (await harnessModel(harnessLookup()));
+          installDaemonLlmEnv(model);
+        } catch {
+          /* the daemon keeps whatever environment it already had; the page's setup still runs */
+        }
+      })();
+    };
+    refreshDaemonModelEnv();
+
+    /**
      * Re-entrancy latch.
      *
      * Reading the harness's facts calls `settings.describe()`, and describe() emits
@@ -484,6 +525,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
       setRuntimeConfigSource(source);
       publishHostOverrides();
       publishModelChoices();
+      refreshDaemonModelEnv();
       const request = pendingSetupRequest(lastRequest, readSettings(config));
       if (request !== undefined) {
         lastRequest = request;
