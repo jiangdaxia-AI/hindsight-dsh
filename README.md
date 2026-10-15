@@ -159,6 +159,50 @@ where twenty harnesses share it; this package carries a pinned copy of that sour
 the two never drift apart silently. Only the extra configuration seam (`loadConfig({ overrides })`
 and `setRuntimeConfigSource`) is shared with the other harnesses.
 
+## The session lifecycle
+
+How a conversation actually flows through memory, event by event. Every handler below is bound in
+the runtime's `apply()` and is fail-open: a daemon that is down costs that one effect, never the
+turn.
+
+```
+session opens ── agent/created ─▶ bank resolved · compaction ledger restored · seed if cold
+you send a prompt ── agent/pre-step ─▶ reflect/knowledge search → block injected (deduped)
+model works (may call hindsight_* tools) ── session/event ─▶ ledger folded (O(1) per append)
+turn completes ── agent/turn-stopping ─▶ transcript retained · code facts (opt-in)
+dsh compacts ── session/event ─▶ dropped spans retained as compaction:<session>:<id>
+session closes ── agent/disposed ─▶ in-flight writes drained · per-session state dropped
+```
+
+- **`agent/created` / `agent/session-start`** — the directory the session works in resolves to a
+  bank (`coding-agent::{gitProject}` by default; linked worktrees share the main checkout's bank).
+  A *resumed* session replays its log into the compaction ledger, and `ensureSeeded` runs the
+  first-open seed exactly once per repo: commit-message history as a `gitlog:<repo>` document, a
+  read-only codebase survey, per-commit deepening in the background, and the five knowledge pages
+  with their own refresh schedules.
+- **`agent/pre-step`** — the one awaited hook, so it stays cheap. When this step claims a real
+  *user* prompt (tool continuations claim none), one retrieval runs — `autoInject: "reflect"` does
+  a deep reflect, `"pages"` searches knowledge pages only — and the result is appended to the
+  batch as a plugin message, last, closest to the model's turn. Identical consecutive blocks are
+  not re-injected, so history does not stack copies. Independently of any prompt, compaction
+  recovery runs here: spans the window dropped are named as a near-zero-cost pointer, and
+  `hindsight_read_compacted` reads any of them back verbatim.
+- **`session/event`** — every appended event folds into that session's ledger; a single map lookup
+  decides whether the session is tracked at all (subagents and opted-out repos are not).
+- **`agent/turn-stopping`** — the only moment the completed exchange is readable, so the write-back
+  happens here: the whole turn's transcript is retained as `conversation:session-<uuid>`
+  (`source:chat`, `harness:dsh`). With `codeFactEnabled: true` the uncommitted working-tree diff —
+  narrowed to the files this session's tool calls actually touched — is retained as
+  `codefact:<session>:<digest>`, because the transcript deliberately drops tool output and cannot
+  answer "what does the code do *now*".
+- **`agent/disposed`** — in-flight write-backs are drained while the session log is still
+  attached, then every per-session map entry is dropped.
+
+On the server side, a retain is the start of a pipeline, not the end: fact extraction pulls
+world/experience facts out of the raw text, consolidation folds them into observations, and the
+knowledge pages' mental models refresh on their own schedules. Retries from a busy LLM gateway
+queue in the background — a 503 costs latency, not data.
+
 ## Inspecting memory
 
 Memory is otherwise invisible from the outside: the plugin writes to a bank on a server, and the
@@ -413,6 +457,8 @@ Then start the daemon and check `/health` reports `"database":"connected"`.
 | Page shows *This plugin is not loaded* | The Host is not serving the settings namespace: the Loader row is disabled or failed. |
 | `/hindsight` is not offered in the composer | The command registry was absent or another plugin owns the name; `plugin.log` says whether `hindsight command registered` was written. `hindsight-dsh doctor` still answers from a shell. |
 | A session has no memory but the log looks clean | `hindsight-dsh doctor`: a bind line is written only when the bind COMPLETED, so its absence (or a `FAILED` line) is the failure itself. |
+| `reflect` answers `Connection error` while the LLM URL answers from a shell | The daemon's HTTP stack routes even `127.0.0.1` through the OS proxy, and a proxy that is down refuses the connection. Since 727b934 the plugin mirrors the system proxy into `HTTP(S)_PROXY` and exempts `127.0.0.1,localhost` in `NO_PROXY` before spawning — but a daemon started by an older plugin (or by hand, without those) keeps the behaviour. Restart it from a session once. **Never fix this by exporting a bare `NO_PROXY`:** Python then ignores the system proxy entirely, and on a machine whose only route out is that proxy the daemon cannot even reach `huggingface.co` — init dies at 300s instead. |
+| `daemon_start_failed` after "Installed 210 packages" | A cold `uvx` cache installs the whole API environment inside the embed's default 180s startup wait; the same start takes ~40s warm. The plugin now raises the budget to 300s (`HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT`) when the environment is silent — export your own value if you want a different one, or simply start it again now that the cache is warm. |
 
 The plugin's log is `~/.hindsight/coding-agents-logs/plugin.log` (override with
 `HINDSIGHT_LOG_FILE`), and it starts with one line per process naming the mode in force — the bind
