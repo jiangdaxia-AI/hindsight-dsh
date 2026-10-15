@@ -37,18 +37,31 @@ import {
 } from "../vendor/coding-agents/src/dsh";
 import { HOST_OVERRIDES_ENV, loadConfig } from "../vendor/coding-agents/src/core/config";
 import { hasUvx, isServerHealthy, startDaemonDetached } from "../vendor/coding-agents/src/core/daemon";
+import { resolveHostMemory } from "../vendor/coding-agents/src/core/host-client";
 import { log } from "../vendor/coding-agents/src/core/log";
+import { syncStatus } from "../vendor/coding-agents/src/core/status";
+import { registerHindsightCommand, type CommandScope } from "./command";
 import { DEFAULT_SETTINGS, NAMESPACE, type DshSettings } from "./fields";
+import { HARNESS } from "./harness";
+import { createInspectApi, type InspectDeps } from "./inspect";
 import { Config, toRuntimeConfig } from "./settings";
 import { applyDaemonLlmEnv } from "./daemon-llm";
 import { ensureUvOnPath } from "./uv";
-import { harnessFacts, harnessModel, harnessModelChoices, serviceOf, type SettingsServiceLike } from "./harness-services";
+import {
+  harnessFacts,
+  harnessModel,
+  harnessModelChoices,
+  serviceOf,
+  type ServiceLookup,
+  type SettingsServiceLike,
+} from "./harness-services";
 import {
   installUv,
   modelFromChoice,
   needsRestartFor,
   runSetup,
   type DaemonModel,
+  type HarnessRouteFacts,
   type SetupDeps,
 } from "./setup";
 import { parseSetupStatus, serializeSetupStatus, type SetupStatus } from "./setup-types";
@@ -58,13 +71,6 @@ export const name = "hindsight";
 
 /** The agent registry owns the lifecycle events the runtime binds; without it there is nothing to do. */
 export const inject = runtimeInject;
-
-/**
- * Which harness this plugin is. Must match the runtime's own id: the local service resolves
- * per-harness overrides and writes its log under this name, and a mismatch makes the two halves
- * describe different installs.
- */
-const HARNESS = "dsh";
 
 /** How many times one settings write is reissued while the Host's write path is busy. */
 const SETTINGS_WRITE_TRIES = 40;
@@ -250,6 +256,34 @@ export function apply(ctx: HostContext, config?: unknown): void {
     let running = false;
 
     /**
+     * The scope dsh's own services answer from, once the injected child below exists.
+     *
+     * This plugin's own context injects the agent registry alone (the runtime's list), and on a
+     * Cordis context a service it did not inject cannot be read off that context at all: the
+     * property read throws `cannot get property "llm" without inject` rather than yielding
+     * `undefined`, which is the opposite of the "these services are optional" contract
+     * `harness-services.ts` documents. `settings`, `credentials` and `llm` are therefore read
+     * through the child context `ctx.inject` hands its callback — the one fibre they WERE injected
+     * into — and every read tolerates their absence.
+     *
+     * WHY IT IS LOAD-BEARING: the facts read is what turns into the bind. When it threw off this
+     * plugin's own context, the throw landed in the fail-open catch at the bottom of this function,
+     * so no hook and no tool was ever registered and every session ran memoryless — with the only
+     * trace on the host's console, which keeps no file (2026-10-14).
+     */
+    let harnessScope: ServiceLookup | undefined;
+    /** Where a harness-service read should go: the injected child, or this context until it exists. */
+    const harnessLookup = (): ServiceLookup => harnessScope ?? (ctx as ServiceLookup);
+    /** dsh's own model facts, or the empty set when this composition cannot produce them. */
+    const harnessFactsHere = (): HarnessRouteFacts => {
+      try {
+        return harnessFacts(harnessLookup());
+      } catch {
+        return { routes: [], namespaces: [] };
+      }
+    };
+
+    /**
      * Re-entrancy latch.
      *
      * Reading the harness's facts calls `settings.describe()`, and describe() emits
@@ -275,7 +309,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
       if (publishingChoices) return;
       publishingChoices = true;
       try {
-        const serialized = JSON.stringify(harnessModelChoices(harnessFacts(ctx as never)));
+        const serialized = JSON.stringify(harnessModelChoices(harnessFactsHere()));
         const previous = readSettings(config).modelChoices?.trim() ?? "";
         if (serialized === previous || (serialized === "[]" && previous === "")) return;
         void settleSettingsWrite(
@@ -319,7 +353,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
         env: process.env,
         // The user's pick is resolved against the same facts as the default, so both come from
         // dsh's own configuration — the only place a daemon model may come from now.
-        resolveChosenModel: async () => modelFromChoice(current(), harnessFacts(ctx as never)),
+        resolveChosenModel: async () => modelFromChoice(current(), harnessFactsHere()),
         publish: (status) => {
           publish?.(status);
           log.info(HARNESS, "local setup", {
@@ -332,7 +366,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
         ensureUv: (configuredDir) => ensureUvOnPath({ configuredDir }),
         hasUvx,
         installUv: () => installUv(),
-        resolveHarnessModel: () => harnessModel(ctx as never),
+        resolveHarnessModel: () => harnessModel(harnessLookup()),
         daemonTarget: () => {
           const cfg = resolved();
           return { apiUrl: cfg.apiUrl, port: cfg.apiPort };
@@ -380,6 +414,9 @@ export function apply(ctx: HostContext, config?: unknown): void {
     // form from the Config schema beside it.
     ctx.inject?.(["settings", "credentials", "llm"], (child) => {
       const scope = (child ?? ctx) as HostContext;
+      // The one scope these three services are readable from (see `harnessScope`): everything that
+      // asks dsh about its own model goes through it from here on.
+      harnessScope = scope;
       settingsService = serviceOf<SettingsServiceLike>(scope as never, "settings");
       // The choice list is available the moment the services are, not only after the first save.
       publishModelChoices();
@@ -404,6 +441,41 @@ export function apply(ctx: HostContext, config?: unknown): void {
       );
     });
 
+    /**
+     * Everything the `/hindsight` report needs for one directory, resolved when it is asked.
+     *
+     * `resolveHostMemory` is the runtime's own resolver, so the command answers about the bank a
+     * SESSION in that directory writes to — the settings page's endpoint, a `mapPathToBank` /
+     * `banks.<id>` route and `optInOnly` included, and read at call time so a field saved a second
+     * ago is the one in force. Building the client sends nothing.
+     */
+    const inspectFor = (directory: string): InspectDeps => {
+      const memory = resolveHostMemory(HARNESS, directory, toRuntimeConfig(readSettings(config)));
+      return {
+        api: createInspectApi(memory.client),
+        cfg: memory.cfg,
+        directory,
+        bankId: memory.bankId,
+        // No resolved bank means nothing to summarise (disabled, or opted out in this directory).
+        ...(memory.bankId === "" ? {} : { sync: () => syncStatus(memory.client, memory.bankId, directory) }),
+      };
+    };
+
+    /** Where an asking agent works. dsh records it on the session header; a session without one is
+     *  rare, and the process cwd is the honest fallback. */
+    const directoryOf = (agent: unknown): string => {
+      const session = (agent as { session?: { header?: { cwd?: unknown } } } | undefined)?.session;
+      const cwd = session?.header?.cwd;
+      return typeof cwd === "string" && cwd !== "" ? cwd : process.cwd();
+    };
+
+    // The human-facing surface: `/hindsight`. Optional in the same way the tools registry and the
+    // settings service are — a composition without a command registry loses the command, not
+    // memory. A plain registration is global, so this one row serves every agent preset.
+    ctx.inject?.(["commands"], (child) => {
+      registerHindsightCommand((child ?? ctx) as CommandScope, { directoryOf, inspectFor });
+    });
+
     // A volatile-only write updates the config references in place, so reading through this same
     // thunk now answers with the saved values; installing it again is what drops the cached
     // workspaces that were built against the old ones. The same event carries the page's one-click
@@ -425,7 +497,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
     const uv = ensureUvOnPath({ configuredDir: settings.uvDir });
     // The local server extracts with a model of its own — always one of dsh's configured models,
     // resolved through the harness facts; there is no hand-typed route into the daemon anymore.
-    const daemonModelCount = harnessModelChoices(harnessFacts(ctx as never)).length;
+    const daemonModelCount = harnessModelChoices(harnessFactsHere()).length;
     applyHindsight(ctx as never);
     // One line per process, in the plugin log every other Hindsight harness writes. It is the only
     // way to answer "is memory actually on, and where is it pointed" without a session in flight,
@@ -443,10 +515,16 @@ export function apply(ctx: HostContext, config?: unknown): void {
     // never be able to do that. The session simply runs without memory, and the reason is on the
     // plugin log.
     //
+    // BOTH sinks, deliberately. `ctx.logger` is the host's console, which on this host goes to the
+    // Electron process and is kept in no file — a bind that failed this way was invisible for hours
+    // (2026-10-14), while `plugin.log` showed nothing at all because the bind line never ran. The
+    // plugin's own log is the one a user can still read afterwards.
+    //
     // The logger call is NOT detached: on the Cordis context proxy every property read goes through
     // a getter, so pulling `ctx.logger.error` out as a value loses its receiver and the call
     // throws "this is not a function" — hiding the very reason it wanted to report.
     const line = `hindsight: memory disabled — the plugin failed to bind: ${error instanceof Error ? error.message : String(error)}`;
+    log.error(HARNESS, line);
     if (ctx.logger && typeof ctx.logger.error === "function") ctx.logger.error(line);
     else console.error(line);
   }

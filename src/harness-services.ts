@@ -51,8 +51,17 @@ export interface ServiceLookup {
 export function serviceOf<T>(ctx: ServiceLookup, name: string): T | undefined {
   const fromGet = ctx.get?.(name);
   if (fromGet !== undefined && fromGet !== null) return fromGet as T;
-  const direct = (ctx as Record<string, unknown>)[name];
-  return direct === undefined || direct === null ? undefined : (direct as T);
+  try {
+    const direct = (ctx as Record<string, unknown>)[name];
+    return direct === undefined || direct === null ? undefined : (direct as T);
+  } catch {
+    // On a Cordis context that property read IS a service lookup, and it THROWS for a service the
+    // calling fibre did not inject — `cannot get property "llm" without inject`. Every caller here
+    // treats these services as optional, so a lookup nobody can answer is exactly that: "this
+    // composition does not expose it". Asking must never be fatal; on 2026-10-14 it was, and the
+    // plugin bound to nothing (see `harnessFactsHere` in host.ts).
+    return undefined;
+  }
 }
 
 /** The provider/model dsh currently uses, read from its own configuration. */

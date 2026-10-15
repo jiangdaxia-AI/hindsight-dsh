@@ -1,0 +1,47 @@
+#!/bin/sh
+# hindsight-dsh — the plugin's memory reports (`/hindsight`) from a shell.
+#
+# The reports are one ESM entry, so they need Node — and a machine can have none on PATH while dsh
+# ships its own. So this prefers a real `node` and falls back to dsh's Electron binary in Node mode,
+# which is the same interpreter the plugin runs under inside the application.
+#
+# Both ends are overridable for a checkout or an app that is not where this one is:
+#
+#   HINDSIGHT_DSH_DIR   the checkout holding dist/cli.js   (default: the parent of this script)
+#   DSH_APP             the DeepSeek Harness binary        (default: the macOS install path)
+#
+# Symlink it onto your PATH — `ln -s "$PWD/scripts/hindsight-dsh" ~/.local/bin/hindsight-dsh` — and
+# the resolution below follows the link back to the checkout.
+set -eu
+
+# Resolve this script through any symlinks, so a link on $PATH still finds the checkout beside it.
+launcher=$0
+while [ -L "$launcher" ]; do
+  directory=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd -P)
+  target=$(readlink "$launcher")
+  case $target in
+    /*) launcher=$target ;;
+    *) launcher=$directory/$target ;;
+  esac
+done
+
+checkout=${HINDSIGHT_DSH_DIR:-$(CDPATH= cd -- "$(dirname -- "$launcher")/.." && pwd -P)}
+cli=$checkout/dist/cli.js
+app=${DSH_APP:-/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness}
+
+if [ ! -f "$cli" ]; then
+  echo "hindsight-dsh: $cli is missing — run 'node scripts/build.mjs' in $checkout" >&2
+  exit 1
+fi
+
+if command -v node >/dev/null 2>&1; then
+  exec node "$cli" "$@"
+fi
+
+if [ ! -x "$app" ]; then
+  echo "hindsight-dsh: no 'node' on PATH, and no DeepSeek Harness at $app" >&2
+  echo "hindsight-dsh: set DSH_APP to the application binary, or run $cli with any Node 20+." >&2
+  exit 1
+fi
+
+exec env ELECTRON_RUN_AS_NODE=1 "$app" "$cli" "$@"

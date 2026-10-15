@@ -22,7 +22,7 @@
  * external `require` calls because the kernel already serves them; bundling a second React would
  * break hooks in ways that are miserable to debug.
  */
-import { mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
@@ -88,6 +88,29 @@ const hostBuild = await build({
   // Only for the dependency assertion below; nothing else consumes this.
   metafile: true,
 });
+
+/**
+ * The shell front door of the reports `/hindsight` shows.
+ *
+ * Its own pass rather than another entry above, because a `bin` entry needs a shebang and the
+ * banner belongs to that file alone — the host half and the spawned siblings are imported or
+ * spawned BY a Node that is already running, so a shebang there is noise. Everything it imports
+ * (the CLI, the reports, the vendored runtime) is bundled in, so it needs no resolution step and no
+ * dependency of its own.
+ */
+await build({
+  ...shared,
+  entryPoints: [resolve(root, "src/cli.ts")],
+  outfile: resolve(root, "dist", "cli.js"),
+  format: "esm",
+  platform: "node",
+  target: "node20",
+  banner: { js: "#!/usr/bin/env node" },
+});
+
+// npm and pnpm shims cope without the executable bit and so does `node dist/cli.js`, but a copied
+// or directly-linked file that lost it fails with a bare EACCES instead of anything readable.
+chmodSync(resolve(root, "dist", "cli.js"), 0o755);
 
 /**
  * The package a resolved path belongs to.
@@ -163,4 +186,6 @@ await build({
   footer: { js: CLIENT_FOOTER },
 });
 
-console.log(`built dist/{host,daemon-start,deepen,mcp-server,survey-supervisor}.js and lib/client.js`);
+console.log(
+  `built dist/{host,cli,daemon-start,deepen,mcp-server,survey-supervisor}.js and lib/client.js`,
+);

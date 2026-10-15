@@ -42,6 +42,8 @@ const HOST_ENTRIES = [
 /** The build output a profile loads: the two halves, plus the patch that mounts the host half. */
 const CLIENT_BUNDLE = "lib/client.js";
 const HOST_BUNDLE = "dist/host.js";
+/** The `bin` entry: the same reports as `/hindsight`, from a shell. */
+const CLI_BUNDLE = "dist/cli.js";
 const PATCH = "cordis.patch.yml";
 
 const problems = [];
@@ -58,18 +60,45 @@ function target(value) {
 }
 
 // 1. Every artifact exists.
-const required = [HOST_BUNDLE, ...HOST_ENTRIES.slice(1).map((name) => `dist/${name}.js`), CLIENT_BUNDLE, PATCH];
+const required = [
+  HOST_BUNDLE,
+  ...HOST_ENTRIES.slice(1).map((name) => `dist/${name}.js`),
+  CLI_BUNDLE,
+  CLIENT_BUNDLE,
+  PATCH,
+];
 for (const file of required) {
   if (!existsSync(join(ROOT, file))) complain(`missing build artifact: ${file} (run \`pnpm run build\`)`);
 }
 
 // 2. The manifest points at those artifacts, and nowhere else.
 const exportsMap = pkg.exports ?? {};
-const entryFor = { ".": HOST_BUNDLE, "./dsh": HOST_BUNDLE, "./client": CLIENT_BUNDLE };
+const entryFor = {
+  ".": HOST_BUNDLE,
+  "./dsh": HOST_BUNDLE,
+  "./cli": CLI_BUNDLE,
+  "./client": CLIENT_BUNDLE,
+};
 for (const [key, expected] of Object.entries(entryFor)) {
   const actual = pathOf(target(exportsMap[key]));
   if (actual === undefined) complain(`exports["${key}"] is missing`);
   else if (actual !== expected) complain(`exports["${key}"] is ${actual}, expected ${expected}`);
+}
+
+// 2b. The shell reports are reachable. `bin` has to name the built CLI, and that file has to open
+//     with a shebang: without one it is executed as a shell script and dies on the first `import`.
+const binEntry = pathOf(pkg.bin?.["hindsight-dsh"]);
+if (binEntry === undefined) {
+  complain('bin["hindsight-dsh"] is missing — the shell reports would not be installed');
+} else if (binEntry !== CLI_BUNDLE) {
+  complain(`bin["hindsight-dsh"] is ${binEntry}, expected ${CLI_BUNDLE}`);
+} else {
+  try {
+    const firstLine = readFileSync(join(ROOT, CLI_BUNDLE), "utf8").split("\n", 1)[0] ?? "";
+    if (!firstLine.startsWith("#!")) complain(`${CLI_BUNDLE} has no shebang — the bin entry would not run`);
+  } catch {
+    /* missing artifact: already reported above */
+  }
 }
 
 const patchEntry = pathOf(pkg.dsh?.bundle?.patch);

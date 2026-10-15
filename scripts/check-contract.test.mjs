@@ -33,7 +33,13 @@ function manifest(overrides = {}) {
     name: "hindsight-dsh",
     version: "0.1.0",
     type: "module",
-    exports: { ".": "./dist/host.js", "./dsh": "./dist/host.js", "./client": "./lib/client.js" },
+    bin: { "hindsight-dsh": "./dist/cli.js" },
+    exports: {
+      ".": "./dist/host.js",
+      "./dsh": "./dist/host.js",
+      "./cli": "./dist/cli.js",
+      "./client": "./lib/client.js",
+    },
     files: ["dist", "lib", "cordis.patch.yml", "README.md"],
     dsh: {
       manifestVersion: 1,
@@ -50,7 +56,7 @@ function manifest(overrides = {}) {
  * @param options.pkg - manifest overrides.
  * @param options.coreSource - contents of the one vendored source file, for spawn-target tests.
  */
-function makeProject({ pkg = {}, coreSource = "export const log = () => {};\n", skip = [] } = {}) {
+function makeProject({ pkg = {}, coreSource = "export const log = () => {};\n", cliSource, skip = [] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "check-contract-"));
   cleanups.push(root);
 
@@ -62,6 +68,9 @@ function makeProject({ pkg = {}, coreSource = "export const log = () => {};\n", 
   mkdirSync(join(root, "lib"), { recursive: true });
   for (const name of HOST_ENTRIES) {
     if (written(`dist/${name}.js`)) writeFileSync(join(root, "dist", `${name}.js`), "export {};\n");
+  }
+  if (written("dist/cli.js")) {
+    writeFileSync(join(root, "dist", "cli.js"), cliSource ?? "#!/usr/bin/env node\nexport {};\n");
   }
   if (written("lib/client.js")) writeFileSync(join(root, "lib", "client.js"), "module.exports = {};\n");
   if (written("cordis.patch.yml")) writeFileSync(join(root, "cordis.patch.yml"), "- insert: []\n");
@@ -115,6 +124,24 @@ describe("the packaging contract", () => {
     const result = run(makeProject({ pkg: { dsh: { bundle: { patch: "./cordis.patch.yml" } } } }));
     expect(result.code).toBe(1);
     expect(result.output).toContain("dsh.client.platform");
+  });
+
+  it("fails when the bin entry does not name the built CLI", () => {
+    const result = run(makeProject({ pkg: { bin: { "hindsight-dsh": "./dist/host.js" } } }));
+    expect(result.code).toBe(1);
+    expect(result.output).toContain('bin["hindsight-dsh"]');
+  });
+
+  it("fails when the CLI has no shebang, which is how a bin entry actually runs", () => {
+    const result = run(makeProject({ pkg: {} , cliSource: "export {};\n" }));
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("has no shebang");
+  });
+
+  it("fails when the CLI was never built", () => {
+    const result = run(makeProject({ skip: ["dist/cli.js"] }));
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("dist/cli.js");
   });
 
   it("fails when `files` would not ship a required artifact", () => {

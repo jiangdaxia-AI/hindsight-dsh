@@ -159,6 +159,91 @@ where twenty harnesses share it; this package carries a pinned copy of that sour
 the two never drift apart silently. Only the extra configuration seam (`loadConfig({ overrides })`
 and `setRuntimeConfigSource`) is shared with the other harnesses.
 
+## Inspecting memory
+
+Memory is otherwise invisible from the outside: the plugin writes to a bank on a server, and the
+agent's own `hindsight_*` tools are the only window onto it — the model has to ask. Two front doors
+open the same read-only reports to *you*:
+
+- **`/hindsight`** inside dsh (Web client and CLI). It runs against the agent without creating a
+  model message, so asking costs no turn and never enters the context the model reasons over.
+- **`hindsight-dsh`** from a shell — the same code, for when the thing being debugged is dsh itself.
+  `dist/cli.js` is the package's `bin` entry, so `npx hindsight-dsh doctor` also works.
+
+```text
+/hindsight                        this repository: resolved bank, records, sync state, log paths
+/hindsight banks [--all]          every bank on the server, newest write first
+/hindsight bank <bank_id>         one bank: documents, knowledge pages, running extractions
+/hindsight documents <bank_id>    the documents themselves: id, last write, provenance tags
+/hindsight doctor                 plugin self-check: bind line, daemon, config, logs
+```
+
+```console
+$ /hindsight
+hindsight · dsh memory
+  plugin    daemon · http://127.0.0.1:9077 · daemon healthy
+  repo      /Users/me/work/api → coding-agent::api
+  records   686 facts · 7 documents · 5 knowledge pages · last write 2026-10-14 15:01
+  sync      synced · gitlog yes · deepen 12/36 · chats 4 · pages 5 · survey 2 behind · ops 0
+  projects  2 bank(s) from this integration, 2 total — /hindsight banks
+  config    ~/.hindsight/coding-agent.json
+  logs      ~/.hindsight/coding-agents-logs
+```
+
+`banks` answers "which projects has this recorded?" from the list endpoint alone — one request, and
+the fact count and last write the server already carries. The other reports are one question each:
+
+| Command | Answers |
+|---|---|
+| `hindsight-dsh banks` | which banks exist, how much is in each, when it last moved |
+| `hindsight-dsh bank <id>` | documents, knowledge pages by name, extractions still running |
+| `hindsight-dsh documents <id>` | the documents themselves — id, last write, provenance tags — filtered with `--tags` / `--q` |
+| `hindsight-dsh [status]` | which bank THIS directory resolves to, and whether a session here has seeded it |
+| `hindsight-dsh doctor` | is the plugin bound, is the daemon up, does the config exist, which log has what |
+
+Flags: `--cwd <dir>` asks about another repository — resolved by the same rules a session uses
+(`mapPathToBank`, `banks.<id>`, `optInOnly`) — `--json` prints the structured report for a script,
+and `--help` prints the usage. `documents` takes its own: `--limit <n>` (default 20, max 500),
+`--tags <a,b>` for documents carrying **all** of them (`source:chat`, `knowledge:decision`, a
+`retainTags` entry), and `--q <text>` for a substring of the document id.
+
+A machine can have no `node` on `PATH` while dsh ships its own, which is exactly the machine this
+plugin is usually debugging on. `scripts/hindsight-dsh` covers that: it runs the same CLI through the
+application's binary in Node mode, and prefers a real `node` when one exists. Symlink it onto your
+`PATH` and the reports behave like any other command:
+
+```sh
+ln -s "$PWD/scripts/hindsight-dsh" ~/.local/bin/hindsight-dsh
+hindsight-dsh banks
+```
+
+Set `HINDSIGHT_DSH_DIR` if the checkout is not the script's parent, or `DSH_APP` if the application is
+not at the macOS install path. Both failures say which of the two is missing.
+
+Everything is read-only, every request carries the same credential the plugin uses, and the token is
+never printed. A report that cannot reach the server says so rather than failing: "the server did not
+answer" is usually the answer.
+
+`doctor` reads the tails of the three logs, which is what makes it the one report that still works
+when nothing else does:
+
+```console
+$ hindsight-dsh doctor
+hindsight doctor
+  config    ~/.hindsight/coding-agent.json (absent — defaults + environment)
+  plugin    daemon · http://127.0.0.1:9077 · host overrides published
+  daemon    healthy
+  bind      last "memory plugin bound" 2026-10-14 19:11 · plugin.log 122 KB
+  diag      last event daemon_restarted at 2026-10-14 16:45
+  usage     last turn 2026-10-14 14:14 in coding-agent::hindsight-main
+  banks     2 from this integration (2 total)
+  logs      ~/.hindsight/coding-agents-logs/…
+```
+
+A `bind` line reading `NO "memory plugin bound"` — or `FAILED — <reason>` — is the whole answer to
+"why did this session have no memory": the plugin fails open, so a bind that throws leaves an agent
+that simply behaves as if the plugin were never installed.
+
 ## Vendored runtime
 
 `vendor/coding-agents/` is a pinned copy of the shared coding-agent runtime — 73 source files plus a
@@ -220,7 +305,7 @@ these sources exist for maintainers and CI, not for users. `check-contract` asse
 
 ```sh
 pnpm install
-pnpm run build           # dist/host.js (host, self-contained) + lib/client.js (browser, loader envelope)
+pnpm run build           # dist/host.js (host) + dist/cli.js (the shell reports) + lib/client.js (browser)
 pnpm test                # unit tests; no dsh needed
 pnpm run typecheck
 pnpm run check-runtime   # the vendored runtime still matches vendor/VENDOR.json
@@ -268,6 +353,9 @@ Then confirm, in order:
 2. The served index contains a client row for this package (fetch `/` with the printed `?token=…`):
    `grep -o 'hindsight-dsh/client.js' index.html`.
 3. The combo URL from that row returns the bundle: `curl -b cookies '<…>/plugins/??hindsight-dsh/client.js&rev=<rev>'`.
+4. `plugin.log` contains `[dsh] hindsight command registered` — the `/hindsight` command reached the
+   command registry. Only the FIRST instance of the row logs it: a persistent host mounts the plugin
+   once per preset composition, and every later registration of the same global name stands down.
 
 ## Publish
 
@@ -323,9 +411,13 @@ Then start the daemon and check `/health` reports `"database":"connected"`.
 | `hindsight: memory disabled — the plugin failed to bind` in the log | The host half threw while binding; a bug in the plugin, reported instead of failing the app's boot. |
 | Daemon mode never answers | `uv`/`uvx` is not on `PATH` (install it, or use `self-hosted`), or its embedded PostgreSQL cannot load Homebrew's OpenSSL on macOS (`brew install openssl@3`), or no model is configured for the local server. The daemon's own log is `~/.hindsight/profiles/<profile>.log`. |
 | Page shows *This plugin is not loaded* | The Host is not serving the settings namespace: the Loader row is disabled or failed. |
+| `/hindsight` is not offered in the composer | The command registry was absent or another plugin owns the name; `plugin.log` says whether `hindsight command registered` was written. `hindsight-dsh doctor` still answers from a shell. |
+| A session has no memory but the log looks clean | `hindsight-dsh doctor`: a bind line is written only when the bind COMPLETED, so its absence (or a `FAILED` line) is the failure itself. |
 
 The plugin's log is `~/.hindsight/coding-agents-logs/plugin.log` (override with
-`HINDSIGHT_LOG_FILE`), and it starts with one line per process naming the mode in force.
+`HINDSIGHT_LOG_FILE`), and it starts with one line per process naming the mode in force — the bind
+line and, once, `hindsight command registered`. `node dist/cli.js doctor` prints the same picture
+without needing dsh to be running.
 
 To disable without uninstalling, add this to the profile's `cordis.patch.yml`:
 

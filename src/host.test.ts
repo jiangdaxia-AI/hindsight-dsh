@@ -167,6 +167,54 @@ describe("host plugin", () => {
     expect(() => apply(broken as never, volatileConfig())).not.toThrow();
     expect(String(errors[0])).toContain("bind exploded");
   });
+
+  it("binds when dsh's services are reachable only from the injected child, as Cordis has them", () => {
+    // What the REAL host looks like. The plugin's own context injects the agent registry alone, so
+    // `ctx.get` finds nothing in the fibre's own store and a direct read of `llm`/`settings`/
+    // `credentials` THROWS — `cannot get property "llm" without inject`. Those three are reachable
+    // only from the child context `ctx.inject` hands its callback. Reading the facts off the
+    // plugin's own context used to throw into the fail-open catch below, so no hook and no tool was
+    // ever registered: every session ran memoryless, and the plugin log stayed empty because the
+    // bind line never ran (2026-10-14).
+    const services: Record<string, unknown> = { settings: stubSettings().service, credentials: {}, llm: {} };
+    const listeners = new Map<string, Set<() => void>>();
+    const errors: unknown[] = [];
+    let toolsBound = false;
+    const ctx = new Proxy(
+      {
+        on(event: string, listener: () => void) {
+          const forEvent = listeners.get(event) ?? new Set();
+          forEvent.add(listener);
+          listeners.set(event, forEvent);
+          return () => {};
+        },
+        inject(deps: string[], callback: (child?: unknown) => void) {
+          // `tools` is the runtime's registry, bound last: reaching it is the proof the bind
+          // completed rather than degrading. The rest is cordis's own dependency gate.
+          if (deps.includes("tools")) toolsBound = true;
+          else if (deps.every((dep) => services[dep] !== undefined)) callback(services);
+          return () => {};
+        },
+        effect: (callback: () => (() => void) | void) => callback(),
+        // Cordis answers `get` from the fibre's own store, which holds no sibling service.
+        get: () => undefined,
+        fiber: {},
+        logger: { error: (message: unknown) => errors.push(message) },
+      },
+      {
+        get(target, prop, receiver) {
+          if (typeof prop === "string" && prop in services) {
+            throw new Error(`cannot get property "${prop}" without inject`);
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      }
+    );
+    expect(() => apply(ctx as never, volatileConfig())).not.toThrow();
+    // Nothing reached the fail-open catch, and the runtime was bound.
+    expect(errors).toEqual([]);
+    expect(toolsBound).toBe(true);
+  });
 });
 
 describe("the one-click setup's trigger", () => {
