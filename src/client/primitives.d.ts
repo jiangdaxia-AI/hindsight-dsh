@@ -10,7 +10,7 @@
  * specifier external, so the bundle keeps `require("@deepseek-ai/dsh-client-ui-primitives")` and
  * the loader answers it at runtime.
  */
-import type { ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 
 /** One scalar field's staged state, straight from `SettingsFormModel.field()`. */
 export interface FieldState {
@@ -142,3 +142,116 @@ export function Switch(props: {
   title?: string;
   className?: string;
 }): ReactNode;
+
+/**
+ * A vector icon from the library's own set.
+ *
+ * Every icon is a 16pt-viewBox SVG that inherits `currentColor` and already carries
+ * `aria-hidden="true"`, which is why an icon beside a label needs no further accessibility work and
+ * an icon-only control carries its name on the button instead. The member list this page uses is
+ * declared below; the library ships roughly two hundred of them.
+ */
+export interface IconProps {
+  size?: number;
+  className?: string;
+}
+
+/**
+ * The host's button.
+ *
+ * `variant` and `size` are the library's own scales: a `md` control is 36px tall and the `sm` one
+ * 28px, `outline` is the neutral stroke the settings pages use for a secondary action, and
+ * `primary` is the filled one. Copying these numbers by hand is how a page drifts from the host's
+ * own controls, so the page uses the component.
+ */
+export function Button(props: {
+  variant?: "primary" | "ghost" | "outline" | "toolbar";
+  size?: "md" | "sm";
+  icon?: ReactNode;
+  className?: string;
+  type?: "button" | "submit" | "reset";
+  disabled?: boolean;
+  title?: string;
+  "aria-label"?: string;
+  onClick?: (event: unknown) => void;
+  children?: ReactNode;
+}): ReactNode;
+
+/** A fixed-geometry capsule label; `tone` is its only palette knob. */
+export function Tag(props: {
+  tone?: "outline" | "solid" | "neutral" | "quiet" | "success" | "info" | "warning" | "danger";
+  className?: string;
+  children?: ReactNode;
+}): ReactNode;
+
+/**
+ * The host's status dot, whose colour comes from the theme's state steps rather than from a prop.
+ *
+ * `ongoing` is the one non-dot state: a spinner with the same footprint.
+ */
+export function StateDot(props: {
+  state: "done" | "warning" | "error" | "idle" | "ongoing";
+  size?: number;
+  appearance?: "dot" | "step";
+  className?: string;
+}): ReactNode;
+
+/**
+ * A hover/focus label anchored to its single child, which it clones to attach its listeners — so
+ * the child must accept a ref, as the library's own `Button` does.
+ *
+ * `side` and `align` decide the placement; the library flips the bubble to keep it inside the
+ * viewport, so a row near an edge needs no handling here.
+ */
+export function Tooltip(props: {
+  label: ReactNode;
+  side?: "top" | "right" | "bottom" | "left";
+  align?: "start" | "center" | "end";
+  gap?: number;
+  disabled?: boolean;
+  children: ReactElement;
+}): ReactNode;
+
+/**
+ * The host's dialog: a portal over a blurred mask, with focus trapped inside and Escape wired to
+ * `onClose`. `headless` drops the header/body and hands the whole surface to the caller.
+ */
+export function Modal(props: {
+  open: boolean;
+  onClose: () => void;
+  title?: ReactNode;
+  closeLabel?: string;
+  description?: ReactNode;
+  children?: ReactNode;
+  footer?: ReactNode;
+  className?: string;
+  contentClassName?: string;
+  headless?: boolean;
+  onKeyDownCapture?: (event: unknown) => void;
+}): ReactNode;
+
+/**
+ * The host's destructive-action dialog: the warning, the acknowledgement checkbox the user must
+ * tick, and the cancel/confirm pair. A confirm is impossible until `acknowledged` is true, which is
+ * what makes it a two-step confirmation rather than a styled OK button.
+ */
+export function RiskConfirmation(props: {
+  open: boolean;
+  title: ReactNode;
+  description: ReactNode;
+  acknowledgeLabel: ReactNode;
+  cancelLabel: string;
+  closeLabel: string;
+  confirmLabel: string;
+  acknowledged: boolean;
+  disabled?: boolean;
+  onAcknowledgedChange: (next: boolean) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}): ReactNode;
+
+export function IconRefreshOutlineRegular(props: IconProps): ReactNode;
+export function IconTrashOutlineRegular(props: IconProps): ReactNode;
+export function IconDatabaseOutlineRegular(props: IconProps): ReactNode;
+export function IconWarningOutlineRegular(props: IconProps): ReactNode;
+export function IconChevronDownOutlineRegular(props: IconProps): ReactNode;

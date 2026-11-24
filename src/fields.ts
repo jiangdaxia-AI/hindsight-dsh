@@ -28,6 +28,16 @@ export type LogLevel = (typeof LOG_LEVELS)[number];
 
 /** Every value the settings page can write, as the page and the host schema both see it. */
 export interface DshSettings {
+  /**
+   * Whether the user has ever SAVED this page.
+   *
+   * The overrides layer outranks `~/.hindsight/coding-agent.json`, so a page that projected its
+   * defaults unconditionally would override the file of a user who installed the plugin and never
+   * opened the settings. Until this marker is set, `toRuntimeConfig` projects nothing and the file
+   * is the single source of truth; the first save adopts the page as the authoritative surface for
+   * every field it renders.
+   */
+  adopted: boolean;
   enabled: boolean;
   serverMode: ServerMode;
   apiUrl: string;
@@ -54,9 +64,14 @@ export interface DshSettings {
   /**
    * A nonce the page writes to ask the host half to prepare the local service.
    *
-   * It rides the settings document because that is the only channel a client plugin has into its own
-   * host half: the host sees the write, and an unchanged value is not a new request. The host clears
-   * it once the run is accepted, so no nonce is left in the profile.
+   * It rides the settings document because the request and its answer ARE configuration — the run
+   * resolves the very fields around them, and an unchanged value is not a new request, which is what
+   * keeps the nonce from surviving as a preference. The host clears it once the run is accepted.
+   *
+   * This is NOT the only channel a client plugin has into its own host half, and it is not the right
+   * one for everything: the settings page's library list and its delete travel an exact Fetch route
+   * on the Host's connection service instead, because a list is not configuration and a refresh must
+   * not rewrite the profile's config file. See `src/bank-admin.ts`.
    */
   setupRequest: string;
   /** The host's answer to {@link DshSettings.setupRequest}: one JSON `SetupStatus`, or "". */
@@ -80,6 +95,7 @@ export interface DshSettings {
  * cannot answer a single request without a token.
  */
 export const DEFAULT_SETTINGS: DshSettings = {
+  adopted: false,
   enabled: true,
   serverMode: "daemon",
   apiUrl: "",

@@ -12,7 +12,7 @@
  */
 import { log } from "../vendor/coding-agents/src/core/log";
 import { HARNESS } from "./harness";
-import { HELP_TEXT, parseInspectInput, runInspect, type InspectDeps } from "./inspect";
+import { describeInvalid, HELP_TEXT, parseInspectInput, runInspect, type InspectDeps } from "./inspect";
 
 /** The command registry, as this plugin uses it (structural: no dsh package is imported). */
 export interface CommandsLike {
@@ -66,10 +66,9 @@ export function registerHindsightCommand(scope: CommandScope, deps: CommandDeps)
     const request = parseInspectInput(rawInput);
     if (request.kind === "help") return { kind: "success", text: HELP_TEXT };
     if (request.kind === "invalid") {
-      // An empty `word` is a subcommand with nothing after it — a different mistake from a typo, and
-      // "unknown option \"\"" would read like a bug in the command rather than in the input.
-      const problem = request.word === "" ? "missing an argument" : `unknown option "${request.word}"`;
-      return { kind: "error", text: `hindsight: ${problem}\n\n${HELP_TEXT}` };
+      // The shared wording — an empty `word` is a subcommand with nothing after it, a different
+      // mistake from a typo; `describeInvalid` owns the spelling so the CLI cannot drift from it.
+      return { kind: "error", text: `hindsight: ${describeInvalid(request)}\n\n${HELP_TEXT}` };
     }
     try {
       const directory = deps.directoryOf(invocation?.agent);

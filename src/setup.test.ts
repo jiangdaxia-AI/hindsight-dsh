@@ -372,4 +372,21 @@ describe("the status the two halves exchange", () => {
     expect(parseSetupStatus(JSON.stringify({ at: 1, phase: "weird" }))).toBeUndefined();
     expect(parseSetupStatus(undefined)).toBeUndefined();
   });
+
+  it("drops a code or step the page has no localization key for, keeping the rest", () => {
+    // A newer host may write a code this page predates; the page localizes through fixed keys
+    // (`setupReason.${code}`), so passing an unknown value through would render a bare key the
+    // user cannot read. The phase still says what happened, so only the unmappable member goes.
+    const status = parseSetupStatus(
+      JSON.stringify({ at: 1, phase: "failed", code: "quantum-decoherence", step: "warp", detail: "boom" })
+    );
+    expect(status).toBeDefined();
+    expect(status?.phase).toBe("failed");
+    expect(status?.code).toBeUndefined();
+    expect(status?.step).toBeUndefined();
+    expect(status?.detail).toBe("boom");
+    // A code the page DOES know survives.
+    const known = parseSetupStatus(JSON.stringify({ at: 1, phase: "failed", code: "uv-missing" }));
+    expect(known?.code).toBe("uv-missing");
+  });
 });

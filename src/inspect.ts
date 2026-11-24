@@ -21,7 +21,7 @@ import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { CONFIG_PATH, type Config } from "../vendor/coding-agents/src/core/config";
 import { diagFilePath } from "../vendor/coding-agents/src/core/diag";
 import { logFilePath, logsDir } from "../vendor/coding-agents/src/core/log";
-import type { SyncStatus } from "../vendor/coding-agents/src/core/status";
+import { syncStatus, type StatusClient, type SyncStatus } from "../vendor/coding-agents/src/core/status";
 import { usageFilePath } from "../vendor/coding-agents/src/core/usage";
 
 /** One request's hard cap, so an inspection can never hang the UI or the shell that asked. */
@@ -33,7 +33,16 @@ const LOG_TAIL_BYTES = 256 * 1024;
 /** Operation statuses that are DONE, so "active" counts only what is still running. */
 const TERMINAL_OPERATIONS = new Set(["completed", "failed", "cancelled", "error"]);
 /** Every bank this integration creates starts with this, so the listing can default to "mine". */
-const BANK_PREFIX = "coding-agent::";
+export const BANK_PREFIX = "coding-agent::";
+/**
+ * The id prefix of a retained conversation.
+ *
+ * The runtime keeps ONE document per session, keyed `conversation:<sessionId>` (see
+ * `vendor/coding-agents/src/core/chat.ts`), so the number of documents carrying this prefix IS the
+ * number of sessions this bank remembers. Exported because the settings page's library list counts
+ * exactly the same thing the report does.
+ */
+export const CONVERSATION_PREFIX = "conversation:";
 /** Documents listed when neither the command nor the CLI says how many. */
 const DEFAULT_DOCUMENT_LIMIT = 20;
 /** Ceiling on `--limit`: a report nobody can read is not a report, and the server caps nothing. */
@@ -197,10 +206,26 @@ export function createInspectApi(transport: InspectTransport): InspectApi {
 
     async pages(bankId: string): Promise<string[]> {
       const body = await json<{ roots?: unknown[] }>(bankUrl(bankId, "/knowledge-base/tree"));
-      return (Array.isArray(body.roots) ? body.roots : [])
-        .filter((node) => isRecord(node) && node.kind === "page")
-        .map((node) => (isRecord(node) && typeof node.name === "string" ? node.name : ""))
-        .filter((name) => name !== "");
+      // THE TREE NESTS. A page filed in a folder is a CHILD of a folder node, never a root, so
+      // reading only the roots reported 5 pages for a bank that held 7: the two initiative pages
+      // live in the `Initiatives` folder (2026-10-15, bank coding-agent::hindsight-dsh), and the
+      // report that exists to answer "what does this bank remember" answered 5 of 7 while
+      // `hindsight_sync_status` — which walks the tree properly — said 7.
+      //
+      // So this walks the whole tree, in the same pre-order `HindsightClient.listPages` uses, and
+      // reads only `kind === "page"` nodes with a usable name. An explicit stack rather than
+      // recursion: the shape arrives from a server, and no payload it can send should end this in
+      // a stack overflow. Children are pushed in reverse so `pop()` yields them in tree order.
+      const pending: unknown[] = (Array.isArray(body.roots) ? [...body.roots] : []).reverse();
+      const names: string[] = [];
+      while (pending.length > 0) {
+        const node = pending.pop();
+        if (!isRecord(node)) continue;
+        if (node.kind === "page" && typeof node.name === "string" && node.name !== "") names.push(node.name);
+        const children = Array.isArray(node.children) ? node.children : [];
+        for (let i = children.length - 1; i >= 0; i -= 1) pending.push(children[i]);
+      }
+      return names;
     },
 
     async activeOperations(bankId: string): Promise<number | null> {
@@ -249,6 +274,41 @@ export type InspectRequest =
   | { kind: "doctor" }
   | { kind: "help" }
   | { kind: "invalid"; word: string };
+
+/**
+ * One wording for an invalid request, shared by the command and the CLI.
+ *
+ * An empty `word` is a subcommand with nothing after it — a different mistake from a typo, and
+ * `unknown option ""` would read like a bug in the command rather than in the input. Both front
+ * doors said this independently before; one spelling here means they cannot drift.
+ */
+export function describeInvalid(request: Extract<InspectRequest, { kind: "invalid" }>): string {
+  return request.word === "" ? "missing an argument" : `unknown option "${request.word}"`;
+}
+
+/**
+ * Build a report's deps from the runtime's own resolver output — the shape both front doors share.
+ *
+ * The command and the CLI each used to assemble this by hand, and the two copies drifted (the
+ * command resolved with the page's overrides, the CLI without). One builder keeps them honest:
+ * whoever calls it passes the overrides it resolved, and the bank/sync wiring is spelled once.
+ *
+ * @param memory - `resolveHostMemory`'s answer for the directory being reported on.
+ * @param directory - the directory the report is about.
+ */
+export function inspectDepsOf(
+  memory: { cfg: Config; bankId: string; client: InspectTransport & StatusClient },
+  directory: string
+): InspectDeps {
+  return {
+    api: createInspectApi(memory.client),
+    cfg: memory.cfg,
+    directory,
+    bankId: memory.bankId,
+    // No resolved bank means nothing to summarise (disabled, or opted out in this directory).
+    ...(memory.bankId === "" ? {} : { sync: () => syncStatus(memory.client, memory.bankId, directory) }),
+  };
+}
 
 /**
  * Read the arguments of `/hindsight`, or of the CLI's positional words.

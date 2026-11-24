@@ -20,6 +20,12 @@ import {
   type SnapshotStore,
 } from "@deepseek-ai/dsh-client-ui-primitives";
 import { DEFAULT_SETTINGS, NAMESPACE, SECRET_FIELD, llmChoiceKey, parseLlmChoice } from "../fields";
+import {
+  LIBRARY_CLIENT_ROUTE,
+  parseLibrariesResponse,
+  type LibrariesResponse,
+  type LibraryRow,
+} from "../library-contract";
 import { parseSetupStatus, type SetupStatus } from "../setup-types";
 
 /** One row of the shared settings-describe mirror, as the browser receives it. */
@@ -27,6 +33,37 @@ interface DescribeRow {
   ns?: string;
   /** Presence markers for `role('secret')` fields: the literal never crosses the wire. */
   secrets?: Array<{ path?: unknown; set?: unknown }>;
+}
+
+/**
+ * What the library list is showing right now.
+ *
+ * `unavailable` is deliberately its own state rather than another error line: it is what a page from
+ * this build sees against a host half from the previous one (whose connection service has no such
+ * route), and the two call for different words — one says "restart", the other says "retry".
+ */
+export interface LibrariesState {
+  status: "idle" | "loading" | "ready" | "unavailable" | "error";
+  rows: LibraryRow[];
+  /** Why the last attempt failed, when it did. */
+  error: string | undefined;
+  /** The server the last successful listing came from. */
+  endpoint: string | undefined;
+  /** Whether banks this integration did not create are included. */
+  all: boolean;
+  /** How many banks the listing left out because `all` is false. */
+  hidden: number;
+  /** The bank a delete is being confirmed for; the confirmation is open while this is set. */
+  confirming: string | undefined;
+  /** The bank a delete is in flight for, so its own button can show that and not others. */
+  deleting: string | undefined;
+  /**
+   * The name of the bank just removed, so the card can say the action landed.
+   *
+   * The LABEL rather than the id: by the time this is shown the row is gone from the listing, so
+   * there is nothing left to look the name up in.
+   */
+  removedLabel: string | undefined;
 }
 
 /** The mirror face `ctx.configForms.describe()` returns. */
@@ -87,6 +124,8 @@ export interface CardState extends FormShell {
   apiTokenConfigured: boolean;
   /** False while the Host has not said: the controls then avoid claiming either state. */
   apiTokenKnown: boolean;
+  /** The project libraries on the server, and the state of the one action that removes one. */
+  libraries: LibrariesState;
 }
 
 /** Booleans and enums, whose values are plain scalars this page stages itself. */
@@ -122,12 +161,36 @@ export class HindsightCardController {
   private failed = false;
   /** When this page last asked for a setup, to tell "not answered yet" from "never asked". */
   private setupRequestedAt: number | undefined;
+  /**
+   * The timer that ends an unanswered setup claim.
+   *
+   * `setupUnanswered` is computed from `Date.now()` inside `projection()`, but a projection only
+   * runs when something PUBLISHES — and a host that never answers is a host that never publishes
+   * again. Without this timer the "not responding" state the page promises could never appear: the
+   * snapshot would sit on `setupPending: true` forever, which is exactly the stuck lie the state
+   * exists to stop. One timer per request, cancelled when the request resolves.
+   */
+  private setupAnswerTimer: ReturnType<typeof setTimeout> | undefined;
   /** Set when the host refused the request write itself: an older host half, before a restart. */
   private setupWriteFailed = false;
   /** field -> whether the Host reports a stored value at that secret path. */
   private readonly secretConfigured = new Map<string, boolean>();
   /** Whether the Host sent presence markers at all: absence is not "not configured". */
   private secretKnown = false;
+  /** The library list, owned here because it outlives any single render of the card. */
+  private readonly libraries: LibrariesState = {
+    status: "idle",
+    rows: [],
+    error: undefined,
+    endpoint: undefined,
+    all: false,
+    hidden: 0,
+    confirming: undefined,
+    deleting: undefined,
+    removedLabel: undefined,
+  };
+  /** Which library request owns the card; an older answer landing late is dropped. */
+  private libraryGeneration = 0;
   private readonly disposers: Array<() => void> = [];
 
   constructor(
@@ -164,8 +227,12 @@ export class HindsightCardController {
     }
   }
 
-  /** Release the form's subscription and this page's mirror subscription. */
+  /** Release the form's subscription, the mirror subscription, and the unanswered-setup timer. */
   dispose(): void {
+    if (this.setupAnswerTimer !== undefined) {
+      clearTimeout(this.setupAnswerTimer);
+      this.setupAnswerTimer = undefined;
+    }
     for (const disposer of this.disposers.splice(0)) disposer();
     this.form.dispose();
   }
@@ -192,21 +259,38 @@ export class HindsightCardController {
    *
    * The nonce is what makes this a request: the host acts on a CHANGED value, and clears it when it
    * accepts, so nothing is left behind in the profile and a retry is a new value.
+   *
+   * WHAT IT DOES NOT WRITE: `enabled: true` past a switch the user JUST staged off. A click on
+   * "prepare the service" is a vote for memory against a SAVED off state, not against a staging
+   * that is newer than the click: a user who toggled `enabled` off and then picked a model had
+   * that staging silently reverted by the old unconditional write, turning the plugin back on
+   * behind their back. `adopted` rides the same mutation: this click is a deliberate act of
+   * configuration, which is exactly what that marker means.
    */
   async runSetup(): Promise<void> {
     const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     this.setupRequestedAt = Date.now();
     this.setupWriteFailed = false;
-    // The staged switches would win over the values written here, so drop the two this writes.
-    this.staged.delete("enabled");
+    this.armSetupAnswerTimer();
+    const ops: SettingsOp[] = [
+      { op: "set", path: ["serverMode"], value: "daemon" },
+      { op: "set", path: ["setupRequest"], value: nonce },
+    ];
+    // Clicking the setup button is itself the user saying "I want memory", so a SAVED `enabled:
+    // false` does not stop the run from turning the switch on — the alternative is a prepared
+    // service the configuration then refuses to use. But a SWITCH THE USER JUST STAGED OFF is
+    // the newer statement: reverting it silently was exactly the wrong read of this click.
+    const mayEnable = this.staged.get("enabled") !== false;
+    if (mayEnable) ops.unshift({ op: "set", path: ["enabled"], value: true });
+    if (this.scope.getSnapshot().value?.adopted !== true) {
+      ops.unshift({ op: "set", path: ["adopted"], value: true });
+    }
+    // The staged switches would win over the values written here, so drop the ones this writes.
     this.staged.delete("serverMode");
+    if (mayEnable) this.staged.delete("enabled");
     this.publish();
     try {
-      const landed = await this.scope.mutate([
-        { op: "set", path: ["enabled"], value: true },
-        { op: "set", path: ["serverMode"], value: "daemon" },
-        { op: "set", path: ["setupRequest"], value: nonce },
-      ]);
+      const landed = await this.scope.mutate(ops);
       // A host half from before this feature has no such field and refuses the write. That is not a
       // failure of the setup but of the upgrade, and it has one remedy: restart the harness.
       if (!landed) {
@@ -218,6 +302,23 @@ export class HindsightCardController {
       this.setupRequestedAt = undefined;
     }
     this.publish();
+  }
+
+  /**
+   * Start (or restart) the timer that publishes the unanswered-setup state.
+   *
+   * The `stalled` projection is computed from the clock, but a projection only runs on publish —
+   * and the whole point of `setupUnanswered` is that the host may never publish again. The timer is
+   * what makes the state reachable. It stays armed past the request's own resolution: an ANSWER
+   * clears `setupRequestedAt`'s claim through a scope write (a publish), and a REFUSED write does
+   * too, so the timer firing after either is a no-op projection, not a wrong one.
+   */
+  private armSetupAnswerTimer(): void {
+    if (this.setupAnswerTimer !== undefined) clearTimeout(this.setupAnswerTimer);
+    this.setupAnswerTimer = setTimeout(() => {
+      this.setupAnswerTimer = undefined;
+      if (this.setupRequestedAt !== undefined) this.publish();
+    }, SETUP_ANSWER_TIMEOUT_MS + 50);
   }
 
   /** The face the slot registration injects into the component. */
@@ -236,7 +337,166 @@ export class HindsightCardController {
         this.stage(field, value);
       },
       runSetup: (): Promise<void> => this.runSetup(),
+      refreshLibraries: (all = false): Promise<void> => this.loadLibraries(all),
+      askRemove: (bankId: string) => {
+        this.askRemove(bankId);
+      },
+      cancelRemove: () => {
+        this.libraries.confirming = undefined;
+        this.publish();
+      },
+      confirmRemove: (): Promise<void> => this.removeConfirmed(),
     };
+  }
+
+  /**
+   * Load the server's project libraries.
+   *
+   * A generation counter guards the answer: a refresh clicked while the first request is still in
+   * flight must not be overwritten by the older one landing second, which is exactly what a slow
+   * first listing plus an impatient second click produces.
+   *
+   * Refused outright while a delete is in flight: the delete's own answer repaints the list, and a
+   * refresh racing it would bump the generation and strand the delete's `deleting`/`confirming`
+   * state forever — the old code let the user click "refresh" mid-delete and lock the whole card.
+   *
+   * @param all - include banks this integration did not create.
+   */
+  async loadLibraries(all = false): Promise<void> {
+    if (this.libraries.deleting !== undefined) return;
+    const generation = ++this.libraryGeneration;
+    this.libraries.status = "loading";
+    this.libraries.error = undefined;
+    this.libraries.removedLabel = undefined;
+    // OPTIMISTIC, and rolled back on failure below: the toggle button and the hidden count read
+    // `all`, so leaving a flipped value behind while the rows on screen are still the OTHER
+    // view's would render a list that lies about which question it answers.
+    const previousAll = this.libraries.all;
+    this.libraries.all = all;
+    this.publish();
+    const answer = await this.callLibraries("GET", all);
+    if (generation !== this.libraryGeneration) return;
+    if (answer === undefined || answer.ok !== true) this.libraries.all = previousAll;
+    this.applyLibraries(answer);
+  }
+
+  /** Open the delete confirmation for one bank. Nothing is sent until it is confirmed. */
+  private askRemove(bankId: string): void {
+    this.libraries.removedLabel = undefined;
+    this.libraries.confirming = bankId;
+    this.publish();
+  }
+
+  /**
+   * Delete the bank the confirmation is open for, then repaint from the answer.
+   *
+   * The host answers a delete with the listing as it stands AFTER the delete, so one round trip both
+   * performs the action and shows its result; a second refresh here would be a second failure point
+   * between the user and the truth.
+   *
+   * The busy state is cleared BEFORE the generation check: whatever else this click raced, the
+   * lock itself must always come off, or one lost race strands `deleting`/`confirming` forever and
+   * the card can never delete anything again.
+   */
+  private async removeConfirmed(): Promise<void> {
+    const bankId = this.libraries.confirming;
+    if (bankId === undefined || this.libraries.deleting !== undefined) return;
+    // Captured BEFORE the call: the answer replaces the listing, so afterwards there is no row left
+    // to read the name off, and a success notice naming a bare id is worse than none.
+    const removedLabel = this.libraries.rows.find((row) => row.bankId === bankId)?.label ?? bankId;
+    const generation = ++this.libraryGeneration;
+    this.libraries.deleting = bankId;
+    this.libraries.error = undefined;
+    this.publish();
+    const answer = await this.callLibraries("POST", this.libraries.all, { action: "delete", bankId });
+    // Unconditional cleanup first: the lock and the dialog must not survive a lost generation.
+    this.libraries.deleting = undefined;
+    if (generation !== this.libraryGeneration) {
+      // A concurrent load won the repaint (a loadLibraries call that slipped in before the guard
+      // above, or a generation bump from an earlier in-flight refresh). Its answer is fresher than
+      // the delete's would have been, so drop ours — but still close the confirmation dialog: the
+      // delete happened (or failed; the repaint says which), and a dialog that cannot be dismissed
+      // is a card the user can no longer operate.
+      this.libraries.confirming = undefined;
+      this.publish();
+      return;
+    }
+    this.libraries.confirming = undefined;
+    if (answer?.ok === true) this.libraries.removedLabel = removedLabel;
+    this.applyLibraries(answer);
+  }
+
+  /**
+   * One call against the library route.
+   *
+   * The BODY decides, not the status: this route answers a refusal it wants the page to read (a
+   * delete guard rejection, a malformed request) with its own JSON envelope and a status that says
+   * which kind of refusal it was, and the page has to render that reason rather than a number. Only
+   * a reply that is NOT this route's envelope is read off the status — and `undefined` there is the
+   * 404 of a path that was never registered, which means this page is talking to a host half from
+   * before this feature existed (or to a composition with no web transport). That is a restart, not
+   * a retry, and the card words it differently — so the distinction is made here, not at the view.
+   *
+   * @param method - GET to list, POST to act.
+   * @param all - whether the listing should include banks of every origin.
+   * @param body - the JSON body of a POST.
+   */
+  private async callLibraries(
+    method: "GET" | "POST",
+    all: boolean,
+    body?: unknown,
+  ): Promise<LibrariesResponse | undefined> {
+    if (typeof fetch !== "function") return undefined;
+    const url = all ? `${LIBRARY_CLIENT_ROUTE}?all=1` : LIBRARY_CLIENT_ROUTE;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        ...(body === undefined
+          ? {}
+          : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+      });
+    } catch (error) {
+      return { ok: false, code: "unreachable", error: error instanceof Error ? error.message : String(error) };
+    }
+    let answer: unknown;
+    try {
+      answer = await response.json();
+    } catch {
+      // Not JSON at all: whatever answered, it was not this route's handler.
+      return response.status === 404
+        ? undefined
+        : { ok: false, code: "unreachable", error: `HTTP ${String(response.status)}` };
+    }
+    const parsed = parseLibrariesResponse(answer);
+    // An envelope that parsed but carried no verdict is still this route answering badly; saying so
+    // is more useful than "HTTP 200".
+    return parsed;
+  }
+
+  /** Fold one answer into the card's state. */
+  private applyLibraries(answer: LibrariesResponse | undefined): void {
+    if (answer === undefined) {
+      this.libraries.status = "unavailable";
+      this.libraries.error = undefined;
+      this.publish();
+      return;
+    }
+    if (!answer.ok) {
+      this.libraries.status = "error";
+      // A refused delete leaves an intact list on screen: the row is still there, and blanking it
+      // would read as "it worked". Only the reason changes.
+      this.libraries.error = answer.error;
+      this.publish();
+      return;
+    }
+    this.libraries.status = "ready";
+    this.libraries.rows = answer.libraries;
+    this.libraries.endpoint = answer.endpoint;
+    this.libraries.all = answer.all;
+    this.libraries.hidden = answer.hidden;
+    this.libraries.error = undefined;
+    this.publish();
   }
 
   /**
@@ -266,6 +526,13 @@ export class HindsightCardController {
         path: [field],
         value,
       }));
+      // The first save adopts this page as the authoritative config surface: until this marker is
+      // set, the host projects NOTHING over the shared config file (see toRuntimeConfig). It rides
+      // the same mutation the save already makes, so adoption cannot be lost to a failure the save
+      // itself survives.
+      if (ops.length && this.scope.getSnapshot().value?.adopted !== true) {
+        ops.unshift({ op: "set", path: ["adopted"], value: true });
+      }
       if (ops.length) {
         // No explicit revision: the scope fences with the latest it holds, and this page holds no
         // read it needs to defend — a conflict here is a lost race, not a stale editor.
@@ -389,6 +656,10 @@ export class HindsightCardController {
       apiToken: this.form.field(SECRET_FIELD),
       apiTokenConfigured: this.secretConfigured.get(SECRET_FIELD) === true,
       apiTokenKnown: this.secretKnown,
+      // A fresh object per projection, not the controller's own: a selector reading
+      // `snapshot.libraries` has to see a new reference when the list changed, or React would keep
+      // the previous render.
+      libraries: { ...this.libraries },
     };
   }
 }
@@ -410,8 +681,9 @@ function parseModelChoices(raw: unknown): Array<{ route: string; model: string }
   }
 }
 
-/** How long a setup request may go unanswered before the page stops claiming it is starting. */
-const SETUP_ANSWER_TIMEOUT_MS = 20_000;
+/** How long a setup request may go unanswered before the page stops claiming it is starting.
+ *  Exported for the timer test that advances the clock past it. */
+export const SETUP_ANSWER_TIMEOUT_MS = 20_000;
 
 /** The form fields this page renders, exported so a test can assert the two halves agree. */
 export const CONTROLLED_FIELDS = FORM_FIELDS;

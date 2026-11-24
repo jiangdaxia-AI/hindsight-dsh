@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SettingsOp, SettingsScope, SettingsScopeSnapshot } from "@deepseek-ai/dsh-client-ui-primitives";
-import { HindsightCardController } from "./controller";
+import { HindsightCardController, SETUP_ANSWER_TIMEOUT_MS } from "./controller";
 import { DEFAULT_SETTINGS, NAMESPACE, SECRET_FIELD } from "../fields";
 import { serializeSetupStatus } from "../setup-types";
 
@@ -102,12 +102,21 @@ describe("settings page controller", () => {
     card.stage("serverMode", "self-hosted");
     face.edit("apiUrl", "http://localhost:9999");
     await face.save();
-    expect(scope.writes[0]).toEqual([{ op: "set", path: ["serverMode"], value: "self-hosted" }]);
+    // The first save adopts the page (see toRuntimeConfig) inside the same mutation as the switches.
+    expect(scope.writes[0]).toEqual([
+      { op: "set", path: ["adopted"], value: true },
+      { op: "set", path: ["serverMode"], value: "self-hosted" },
+    ]);
     expect(scope.writes[1]).toEqual([{ op: "set", path: ["apiUrl"], value: "http://localhost:9999" }]);
     // Both halves clear on success, so Save goes inert again.
     expect(face.hooks.hindsightCard.getSnapshot().dirty).toBe(false);
     expect(scope.value.serverMode).toBe("self-hosted");
     expect(scope.value.apiUrl).toBe("http://localhost:9999");
+    // Adoption is once: a later save writes no marker again.
+    const writesBefore = scope.writes.length;
+    card.stage("logLevel", "debug");
+    await face.save();
+    expect(scope.writes[writesBefore]).toEqual([{ op: "set", path: ["logLevel"], value: "debug" }]);
   });
 
   it("never writes a blank token, leaving the stored one in place", async () => {
@@ -200,6 +209,22 @@ describe("settings page controller", () => {
     expect(scope.value.setupRequest).not.toBe("");
   });
 
+  it("does not turn the plugin back on when the user just switched it off", async () => {
+    // The setup button is a vote for the local service, not for the master switch: staging
+    // `enabled: false` and then clicking setup must not silently revert the user's staging.
+    const scope = new FakeScope({ serverMode: "daemon", enabled: true });
+    const { card, face } = controllerFor(scope);
+    card.stage("enabled", false);
+    await face.runSetup();
+    // The run wrote no `enabled` at all: the staged "off" is the newer statement.
+    const wroteEnabled = scope.writes.some((ops) => ops.some((op) => op.path[0] === "enabled"));
+    expect(wroteEnabled).toBe(false);
+    // And the request still went out: the run is the user's click, whatever the switch says.
+    expect(typeof scope.value.setupRequest).toBe("string");
+    // The staged "off" survives the run, so a Save still commits it.
+    expect(face.hooks.hindsightCard.getSnapshot().enabled).toBe(false);
+  });
+
   it("stops claiming it is starting once the Host answers", async () => {
     const scope = new FakeScope({ serverMode: "daemon" });
     const { face } = controllerFor(scope);
@@ -260,9 +285,10 @@ describe("settings page controller", () => {
       const { face } = controllerFor(scope);
       await face.runSetup();
       expect(face.hooks.hindsightCard.getSnapshot().setupPending).toBe(true);
-      // Past the answer window, "starting" would be a lie the user cannot act on.
-      vi.setSystemTime(Date.now() + 21_000);
-      await scope.mutate([]);
+      // Past the answer window, "starting" would be a lie the user cannot act on — and no scope
+      // write is coming (that is the scenario), so the CONTROLLER must publish on its own: the
+      // timer runSetup armed is the only thing that can flip this state.
+      await vi.advanceTimersByTimeAsync(SETUP_ANSWER_TIMEOUT_MS + 100);
       const state = face.hooks.hindsightCard.getSnapshot();
       expect(state.setupPending).toBe(false);
       expect(state.setupUnanswered).toBe(true);
@@ -276,5 +302,245 @@ describe("settings page controller", () => {
     scope.status = "unavailable";
     const { face } = controllerFor(scope);
     expect(face.hooks.hindsightCard.getSnapshot().available).toBe(false);
+  });
+});
+
+/**
+ * The library list's own channel.
+ *
+ * It is a Fetch route rather than a settings write, so the browser side of it is stubbed at the
+ * `fetch` boundary: what these tests pin is the page's reading of an answer — which states it can
+ * reach, and what it does when the answer is late, missing or a refusal.
+ */
+describe("the settings page's library list", () => {
+  const ROW = {
+    bankId: "coding-agent::repo",
+    label: "repo",
+    factCount: 3,
+    sessions: 2,
+    lastWriteAt: "2026-10-15T10:01:40.000Z",
+  };
+
+  /**
+   * One canned answer per call, in order; a function is called with the request for exactness.
+   *
+   * `text` is the reply a route that is NOT ours gives — the platform's own 404 is the plain body
+   * `not found`, and the page's reading of "is this my route at all" turns on exactly that.
+   */
+  type Answer =
+    | { status?: number; body?: unknown; text?: string }
+    | "reject"
+    | ((url: string, init: RequestInit) => unknown);
+
+  /**
+   * Install a `fetch` that answers the library route.
+   *
+   * @param answers - one entry per expected call, in order.
+   * @returns the calls that were made, as `[url, init]` pairs.
+   */
+  function stubFetch(answers: Answer[]): Array<[string, RequestInit]> {
+    const calls: Array<[string, RequestInit]> = [];
+    vi.stubGlobal("fetch", async (url: string, init: RequestInit = {}) => {
+      calls.push([url, init]);
+      const answer = answers.shift();
+      if (answer === undefined) throw new Error(`unexpected fetch: ${url}`);
+      if (answer === "reject") throw new Error("ECONNREFUSED");
+      if (typeof answer === "function") return answer(url, init);
+      if (answer.text !== undefined) {
+        return new Response(answer.text, { status: answer.status ?? 200, headers: { "content-type": "text/plain" } });
+      }
+      return new Response(JSON.stringify(answer.body ?? {}), {
+        status: answer.status ?? 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    return calls;
+  }
+
+  const payload = (overrides: Record<string, unknown> = {}) => ({
+    ok: true,
+    endpoint: "http://127.0.0.1:9077",
+    serverMode: "daemon",
+    disabled: false,
+    all: false,
+    total: 1,
+    hidden: 0,
+    fetchedAt: "2026-10-15T10:02:00.000Z",
+    libraries: [ROW],
+    ...overrides,
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("starts idle, and holding the row the host sent once it answers", async () => {
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    expect(face.hooks.hindsightCard.getSnapshot().libraries.status).toBe("idle");
+    const calls = stubFetch([{ body: payload() }]);
+    await face.refreshLibraries();
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.status).toBe("ready");
+    expect(libraries.rows).toEqual([ROW]);
+    expect(libraries.endpoint).toBe("http://127.0.0.1:9077");
+    // Document-relative, with no leading slash: the page's route is resolved against the document.
+    expect(calls[0]?.[0]).toBe("api/hindsight/libraries");
+    expect(calls[0]?.[1].method).toBe("GET");
+  });
+
+  it("asks for every library on the server when the user widens the list", async () => {
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    const calls = stubFetch([{ body: payload({ all: true, hidden: 4 }) }]);
+    await face.refreshLibraries(true);
+    expect(calls[0]?.[0]).toBe("api/hindsight/libraries?all=1");
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.all).toBe(true);
+    expect(libraries.hidden).toBe(4);
+  });
+
+  it("calls a route that is not there 'unavailable', which is a restart rather than a retry", async () => {
+    // A page from this build against a host half from before it: the connection service has no such
+    // path, so the answer is a 404 and the page must say so instead of blaming the server.
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    stubFetch([{ status: 404, text: "not found" }]);
+    await face.refreshLibraries();
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.status).toBe("unavailable");
+    expect(libraries.error).toBeUndefined();
+  });
+
+  it("reports a server that does not answer, with the reason, and keeps the list it had", async () => {
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    stubFetch([{ body: payload() }, "reject"]);
+    await face.refreshLibraries();
+    await face.refreshLibraries();
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.status).toBe("error");
+    expect(libraries.error).toBe("ECONNREFUSED");
+    // The rows are still there: a refresh that failed says nothing about what the server holds.
+    expect(libraries.rows).toEqual([ROW]);
+  });
+
+  it("does not let an older listing overwrite a newer one", async () => {
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    let releaseFirst: (() => void) | undefined;
+    const first = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    stubFetch([
+      async () => {
+        await first;
+        return new Response(JSON.stringify(payload({ libraries: [{ ...ROW, label: "stale" }] })), { status: 200 });
+      },
+      { body: payload({ libraries: [{ ...ROW, label: "fresh" }] }) },
+    ]);
+    const slow = face.refreshLibraries();
+    await face.refreshLibraries();
+    releaseFirst?.();
+    await slow;
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.rows[0]?.label).toBe("fresh");
+  });
+
+  it("rolls the view toggle back when a widened refresh fails", async () => {
+    // The list stays on screen with the rows of the view that WAS showing; the toggle button and
+    // the hidden count must not claim the view the failed refresh asked for.
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    stubFetch([{ body: payload() }, "reject"]);
+    await face.refreshLibraries();
+    await face.refreshLibraries(true);
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.status).toBe("error");
+    expect(libraries.rows).toEqual([ROW]);
+    expect(libraries.all).toBe(false); // rolled back, not stuck on the failed request's view
+  });
+
+  it("removes a library through the route, and repaints from the answer to the delete", async () => {
+    const scope = new FakeScope();
+    const { card, face } = controllerFor(scope);
+    const calls = stubFetch([{ body: payload() }, { body: payload({ total: 0, libraries: [] }) }]);
+    await face.refreshLibraries();
+    face.askRemove(ROW.bankId);
+    expect(card.inject().hooks.hindsightCard.getSnapshot().libraries.confirming).toBe(ROW.bankId);
+    await face.confirmRemove();
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    const [, init] = calls[1]!;
+    expect(calls[1]?.[0]).toBe("api/hindsight/libraries");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ action: "delete", bankId: ROW.bankId });
+    expect(libraries.confirming).toBeUndefined();
+    expect(libraries.rows).toEqual([]);
+    // Named, not just gone: a row that silently disappears reads as a rendering bug.
+    expect(libraries.removedLabel).toBe("repo");
+  });
+
+  it("sends nothing at all until a delete is confirmed", async () => {
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    const calls = stubFetch([{ body: payload() }]);
+    await face.refreshLibraries();
+    face.askRemove(ROW.bankId);
+    face.cancelRemove();
+    expect(face.hooks.hindsightCard.getSnapshot().libraries.confirming).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("keeps the list on screen when the host refuses the delete", async () => {
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    stubFetch([
+      { body: payload() },
+      { status: 404, body: { ok: false, code: "refused", error: "no such bank on this server: gone" } },
+    ]);
+    await face.refreshLibraries();
+    face.askRemove(ROW.bankId);
+    await face.confirmRemove();
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.error).toBe("no such bank on this server: gone");
+    expect(libraries.rows).toEqual([ROW]);
+    expect(libraries.removedLabel).toBeUndefined();
+  });
+
+  it("does not deadlock when a refresh races a slow delete", async () => {
+    // The old bug: the refresh bumped the generation while the delete was in flight, the delete's
+    // answer was dropped on its generation check — BEFORE its cleanup ran — and `deleting`/
+    // `confirming` stayed set forever: every delete button disabled, the confirmation dialog open
+    // and its Cancel disabled. The guard on loadLibraries plus cleanup-before-check closes both
+    // doors: the refresh is refused mid-delete, and even a generation bump that slips through
+    // cannot strand the lock.
+    const scope = new FakeScope();
+    const { face } = controllerFor(scope);
+    let releaseDelete: (() => void) | undefined;
+    const deleted = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    stubFetch([
+      { body: payload() },
+      async () => {
+        await deleted;
+        return new Response(JSON.stringify(payload({ total: 0, libraries: [] })), { status: 200 });
+      },
+      { body: payload({ all: true, hidden: 0 }) },
+    ]);
+    await face.refreshLibraries();
+    face.askRemove(ROW.bankId);
+    const confirming = face.confirmRemove();
+    // While the delete is in flight, a refresh click must be a no-op — the delete's own answer
+    // repaints, and a racing generation would strand the delete's lock.
+    await face.refreshLibraries(true);
+    expect(face.hooks.hindsightCard.getSnapshot().libraries.status).not.toBe("loading");
+    releaseDelete?.();
+    await confirming;
+    const libraries = face.hooks.hindsightCard.getSnapshot().libraries;
+    expect(libraries.deleting).toBeUndefined();
+    expect(libraries.confirming).toBeUndefined();
+    expect(libraries.rows).toEqual([]);
+    expect(libraries.removedLabel).toBe("repo");
   });
 });

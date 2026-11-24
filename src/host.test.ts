@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../vendor/coding-agents/src/core/config";
 import { DEFAULT_SETTINGS, type DshSettings } from "./fields";
-import { apply, Config, default as plugin, inject, name, pendingSetupRequest, readSettings } from "./host";
+import { apply, Config, default as plugin, inject, name, pendingSetupRequest, publishSpawnCredentials, readSettings } from "./host";
 import { toRuntimeConfig } from "./settings";
+import { spawnCredentialEnv, SPAWN_CREDENTIALS_PATH } from "../vendor/coding-agents/src/core/spawn-credentials";
 
 let dir: string;
 afterEach(() => {
@@ -215,6 +216,62 @@ describe("host plugin", () => {
     expect(errors).toEqual([]);
     expect(toolsBound).toBe(true);
   });
+
+  it("registers the settings page's library route on the connection service", () => {
+    // The page's list and its delete need a request/response channel, which the settings document
+    // is not. This is the host half of it: one exact Fetch route, at the path the browser half
+    // derives its document-relative caller from, answering both verbs.
+    const routes: Array<{ path: string; methods: string[]; requestBody: string }> = [];
+    const connection = {
+      fetch: {
+        register: (route: { path: string; methods: string[]; requestBody: string }) => {
+          routes.push(route);
+          return () => {};
+        },
+      },
+    };
+    // Cordis hands `inject` a CHILD context on which the injected services are properties; the
+    // shared stub hands back the parent, so this test supplies the child, as the one above does.
+    const base = stubContext().ctx;
+    const ctx = {
+      ...base,
+      inject: (deps: string[], callback: (child?: unknown) => void) => {
+        if (deps.includes("connection")) callback({ ...base, connection });
+        return () => {};
+      },
+    };
+    apply(ctx as never, volatileConfig());
+    expect(routes).toHaveLength(1);
+    expect(routes[0]?.path).toBe("/api/hindsight/libraries");
+    expect(routes[0]?.methods).toEqual(["GET", "POST"]);
+    // Buffered: the delete's body is JSON the handler is about to read.
+    expect(routes[0]?.requestBody).toBe("buffered");
+  });
+
+  it("binds without a connection service, because a headless run has no page to serve", () => {
+    // The route is optional exactly like `settings` and `commands`: this is still the memory plugin
+    // without a web transport, and failing the bind over a route would take memory down with it. The
+    // page renders its own "restart dsh" state against that case.
+    const { ctx, errors } = stubContext();
+    expect(() => apply(ctx as never, volatileConfig())).not.toThrow();
+    expect(errors).toEqual([]);
+  });
+
+  it("binds when the connection service is there but carries no fetch registry", () => {
+    // A Connection that exposes no exact-route table must degrade the same way an absent one does,
+    // rather than throwing from a property read on the injected child.
+    const routes: unknown[] = [];
+    const base = stubContext().ctx;
+    const ctx = {
+      ...base,
+      inject: (deps: string[], callback: (child?: unknown) => void) => {
+        if (deps.includes("connection")) callback({ ...base, connection: {} });
+        return () => {};
+      },
+    };
+    expect(() => apply(ctx as never, volatileConfig())).not.toThrow();
+    expect(routes).toEqual([]);
+  });
 });
 
 describe("the one-click setup's trigger", () => {
@@ -396,7 +453,7 @@ describe("config seam", () => {
       })
     );
     // The page set the endpoint and left the token and bank id blank: the file's values must survive.
-    const overrides = toRuntimeConfig(readSettings(volatileConfig({ serverMode: "self-hosted", apiUrl: "http://localhost:8888" })));
+    const overrides = toRuntimeConfig(readSettings(volatileConfig({ serverMode: "self-hosted", apiUrl: "http://localhost:8888", adopted: true })));
     const cfg = loadConfig({ path: file, harness: "dsh", overrides });
     expect(cfg.serverMode).toBe("self-hosted");
     expect(cfg.apiUrl).toBe("http://localhost:8888");
@@ -404,5 +461,92 @@ describe("config seam", () => {
     expect(cfg.bankId).toBe("file-bank");
     // A switch the page DOES render is projected, so its saved value is what the runtime uses.
     expect(cfg.retainSessions).toBe(true);
+  });
+
+  it("keeps the shared file entirely in force for a page that was never saved", () => {
+    // The overrides layer outranks the file, and every volatile field reads as its DEFAULT until
+    // the user saves — indistinguishable from a deliberate choice of that default. Before
+    // `adopted` is set, the page must project nothing: a hand-configured file is not to be
+    // overridden by defaults the user never saw. (The defaults differ from the file on every
+    // projected field, so a single leaked field fails an assertion below.)
+    dir = mkdtempSync(join(tmpdir(), "hs-seam-"));
+    const file = join(dir, "coding-agent.json");
+    writeFileSync(
+      file,
+      JSON.stringify({
+        serverMode: "self-hosted",
+        apiUrl: "https://file.example",
+        apiToken: "file-token",
+        bankId: "file-bank",
+        apiPort: 1234,
+        retainSessions: false,
+        optInOnly: true,
+        logLevel: "debug",
+      })
+    );
+    const overrides = toRuntimeConfig(readSettings(volatileConfig()));
+    expect(overrides).toEqual({}); // never saved: nothing projected
+    const cfg = loadConfig({ path: file, harness: "dsh", overrides });
+    expect(cfg.serverMode).toBe("self-hosted");
+    expect(cfg.apiUrl).toBe("https://file.example");
+    expect(cfg.apiToken).toBe("file-token");
+    expect(cfg.bankId).toBe("file-bank");
+    expect(cfg.apiPort).toBe(1234);
+    expect(cfg.retainSessions).toBe(false);
+    expect(cfg.optInOnly).toBe(true);
+    expect(cfg.logLevel).toBe("debug");
+  });
+});
+
+describe("spawn credentials", () => {
+  it("never carries the token in the exported overrides layer a descendant would inherit", () => {
+    // The overrides variable travels by inheritance: every descendant of this host — including
+    // the test runners and scripts the AGENT spawns in its sessions — sees it. apply() exports
+    // the layer on bind; the token must never be in THAT string, and must instead be in the
+    // spawn-credentials file, which only a Hindsight child's own spawn boundary reads.
+    const credFile = join(tmpdir(), "hs-spawn-cred-seam.json");
+    process.env.HINDSIGHT_SPAWN_CREDENTIALS = credFile;
+    try {
+      delete process.env.HINDSIGHT_HOST_OVERRIDES;
+      const { ctx } = stubContext();
+      apply(ctx as never, volatileConfig({ adopted: true, apiToken: "tok_123" }));
+      const exported = JSON.parse(process.env.HINDSIGHT_HOST_OVERRIDES ?? "null") as Record<string, unknown> | null;
+      expect(exported).not.toBeNull();
+      expect("apiToken" in (exported as Record<string, unknown>)).toBe(false);
+      expect(spawnCredentialEnv()).toEqual({ HINDSIGHT_API_TOKEN: "tok_123" });
+    } finally {
+      delete process.env.HINDSIGHT_SPAWN_CREDENTIALS;
+      delete process.env.HINDSIGHT_HOST_OVERRIDES;
+      rmSync(credFile, { force: true });
+    }
+  });
+
+  it("records the token in the 0600 spawn-credentials file, and clears it when the setting clears", () => {
+    // The file is the ONLY route the token takes to the children: nodeLaunch injects it into the
+    // one child being spawned (see core/spawn-credentials.ts), so no other descendant sees it.
+    const file = join(tmpdir(), "hs-spawn-cred-test.json");
+    process.env.HINDSIGHT_SPAWN_CREDENTIALS = file;
+    try {
+      publishSpawnCredentials("tok_123");
+      expect(spawnCredentialEnv()).toEqual({ HINDSIGHT_API_TOKEN: "tok_123" });
+      // A cleared page token clears the file: a stale credential must not outlive its setting.
+      publishSpawnCredentials(undefined);
+      expect(spawnCredentialEnv()).toEqual({});
+    } finally {
+      delete process.env.HINDSIGHT_SPAWN_CREDENTIALS;
+      rmSync(file, { force: true });
+    }
+  });
+
+  it("treats an unreadable credentials file as no credential at all", () => {
+    const file = join(tmpdir(), "hs-spawn-cred-broken.json");
+    process.env.HINDSIGHT_SPAWN_CREDENTIALS = file;
+    try {
+      writeFileSync(file, "{not json");
+      expect(spawnCredentialEnv()).toEqual({});
+    } finally {
+      delete process.env.HINDSIGHT_SPAWN_CREDENTIALS;
+      rmSync(file, { force: true });
+    }
   });
 });

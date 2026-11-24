@@ -6,11 +6,13 @@ import type { Config } from "../vendor/coding-agents/src/core/config";
 import type { SyncStatus } from "../vendor/coding-agents/src/core/status";
 import {
   collectBank,
+  describeInvalid,
   collectBanks,
   collectDoctor,
   collectDocuments,
   collectOverview,
   createInspectApi,
+  inspectDepsOf,
   formatBank,
   formatBanks,
   formatDoctor,
@@ -152,7 +154,7 @@ describe("the server adapter", () => {
     expect(asked[0]).toBe("http://127.0.0.1:9077/v1/default/banks?limit=200");
   });
 
-  it("counts documents from the total, and only page nodes as pages", async () => {
+  it("counts documents from the total, and page nodes as pages", async () => {
     const { t } = transport({
       "/documents": { total: 7, items: [{}] },
       "/knowledge-base/tree": { roots: [{ kind: "page", name: "Component map" }, { kind: "folder", name: "x" }] },
@@ -160,6 +162,51 @@ describe("the server adapter", () => {
     const api = createInspectApi(t);
     await expect(api.documentCount("coding-agent::a")).resolves.toBe(7);
     await expect(api.pages("coding-agent::a")).resolves.toEqual(["Component map"]);
+  });
+
+  it("walks into folders, because a filed page is never a root", async () => {
+    // The regression this pins: a bank holding SEVEN pages reported five, because the two in its
+    // `Initiatives` folder are children of a folder node, and the report counted only roots
+    // (2026-10-15, bank coding-agent::hindsight-dsh). Order is the tree's own pre-order, the same
+    // traversal HindsightClient.listPages uses.
+    const { t } = transport({
+      "/knowledge-base/tree": {
+        roots: [
+          { kind: "page", name: "Component map" },
+          {
+            kind: "folder",
+            name: "Initiatives",
+            children: [
+              { kind: "page", name: "Non-blocking session synthesis" },
+              { kind: "folder", name: "Nested", children: [{ kind: "page", name: "Deep page" }] },
+            ],
+          },
+          { kind: "page", name: "Core concepts" },
+        ],
+      },
+    });
+    await expect(createInspectApi(t).pages("coding-agent::a")).resolves.toEqual([
+      "Component map",
+      "Non-blocking session synthesis",
+      "Deep page",
+      "Core concepts",
+    ]);
+  });
+
+  it("drops malformed tree nodes instead of guessing at them", async () => {
+    const { t } = transport({
+      "/knowledge-base/tree": {
+        roots: [
+          null,
+          { kind: "page" }, // no name
+          { kind: "page", name: "" },
+          { kind: "folder", children: "not a list" },
+          { kind: "folder", children: [42, { kind: "folder" }] },
+          { kind: "page", name: "Real page" },
+        ],
+      },
+    });
+    await expect(createInspectApi(t).pages("coding-agent::a")).resolves.toEqual(["Real page"]);
   });
 
   it("counts only operations that are still running", async () => {
@@ -477,5 +524,32 @@ describe("dispatch", () => {
     );
     expect(await runInspect(deps({ api }), { kind: "doctor" })).toContain("hindsight doctor");
     expect(await runInspect(deps({ api }), { kind: "overview" })).toContain("hindsight · dsh memory");
+  });
+});
+
+describe("the shared invalid-request wording", () => {
+  // The command and the CLI both render an invalid request through describeInvalid; one spelling
+  // here is what keeps the two front doors from drifting apart again.
+  it("calls a subcommand with nothing after it 'missing an argument'", () => {
+    expect(describeInvalid({ kind: "invalid", word: "" })).toBe("missing an argument");
+  });
+
+  it("names the unknown word for a typo", () => {
+    expect(describeInvalid({ kind: "invalid", word: "teleport" })).toBe('unknown option "teleport"');
+  });
+});
+
+describe("the shared deps builder", () => {
+  it("carries the resolver's config and bank, and a sync only when a bank resolved", () => {
+    const client = { apiUrl: "http://127.0.0.1:9077", req: async () => ({}) } as never;
+    const cfg = { apiUrl: "http://127.0.0.1:9077", serverMode: "daemon", disabled: false } as never;
+    const withBank = inspectDepsOf({ cfg, bankId: "coding-agent::x", client }, "/repo/x");
+    expect(withBank.cfg).toBe(cfg);
+    expect(withBank.bankId).toBe("coding-agent::x");
+    expect(withBank.directory).toBe("/repo/x");
+    expect(typeof withBank.sync).toBe("function");
+    // A disabled or opted-out directory resolves no bank, and has nothing to summarise.
+    const without = inspectDepsOf({ cfg, bankId: "", client }, "/repo/x");
+    expect(without.sync).toBeUndefined();
   });
 });

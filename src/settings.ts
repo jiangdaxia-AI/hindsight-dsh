@@ -31,6 +31,13 @@ function enumOf<T extends string>(members: readonly T[]) {
 }
 
 const Config = z.object({
+  adopted: z
+    .boolean()
+    .default(DEFAULT_SETTINGS.adopted)
+    .volatile()
+    .description(
+      "Whether the user has ever saved this page. Until then the shared config file stays the single source of truth: the page's defaults must not override it."
+    ),
   enabled: z
     .boolean()
     .default(DEFAULT_SETTINGS.enabled)
@@ -153,32 +160,37 @@ export { Config };
 /**
  * Project the page's values onto the shared runtime's config.
  *
- * Only the fields whose value is actually a CHOICE are projected unconditionally. A text field
- * left empty is omitted rather than sent as `""`, because `mergeRaw` overwrites with whatever the
- * layer holds: writing an empty `apiUrl` would erase a URL from the user's own config file, and
- * writing an empty `bankId` would have to mean "dynamic" twice over. Omission is what lets this
- * page and the shared file coexist — the page wins where it speaks, the file still answers where
- * it does not.
+ * GATED BY `adopted`. The overrides layer outranks the shared config file, and a volatile field
+ * reads as its DEFAULT until the user saves — indistinguishable, from here, from a deliberate
+ * choice of that same default. So before the first save the page projects NOTHING: a user who
+ * configured `~/.hindsight/coding-agent.json` by hand and never opened this page keeps exactly
+ * what their file says. The first save sets `adopted: true` and the page becomes authoritative
+ * for the fields it renders.
+ *
+ * Within the adopted layer, only a field the settings object actually carries is projected, and a
+ * text field left empty is omitted rather than sent as `""`, because `mergeRaw` overwrites with
+ * whatever the layer holds: writing an empty `apiUrl` would erase a URL from the user's own
+ * config file, and writing an empty `bankId` would have to mean "dynamic" twice over.
  *
  * @param settings - the host's resolved Config, as the Loader validated it.
  * @returns the layer `loadConfig` applies above the file and the environment.
  */
 export function toRuntimeConfig(settings: Partial<DshSettings> | undefined): RawConfig {
   const value = { ...DEFAULT_SETTINGS, ...(settings ?? {}) };
-  const raw: RawConfig = {
-    disabled: !value.enabled,
-    serverMode: value.serverMode,
-    apiPort: value.apiPort,
-    bankIdTemplate: value.bankIdTemplate,
-    autoInject: value.autoInject,
-    retainSessions: value.retainSessions,
-    compactionAware: value.compactionAware,
-    rehydrateMode: value.rehydrateMode,
-    codeFactEnabled: value.codeFactEnabled,
-    autoSeed: value.autoSeed,
-    optInOnly: value.optInOnly,
-    logLevel: value.logLevel,
-  };
+  const raw: RawConfig = {};
+  if (value.adopted !== true) return raw;
+  raw.disabled = !value.enabled;
+  raw.serverMode = value.serverMode;
+  raw.apiPort = value.apiPort;
+  raw.bankIdTemplate = value.bankIdTemplate;
+  raw.autoInject = value.autoInject;
+  raw.retainSessions = value.retainSessions;
+  raw.compactionAware = value.compactionAware;
+  raw.rehydrateMode = value.rehydrateMode;
+  raw.codeFactEnabled = value.codeFactEnabled;
+  raw.autoSeed = value.autoSeed;
+  raw.optInOnly = value.optInOnly;
+  raw.logLevel = value.logLevel;
   const url = value.apiUrl?.trim();
   if (url) raw.apiUrl = url;
   const token = value.apiToken?.trim();

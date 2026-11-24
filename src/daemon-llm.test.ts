@@ -6,6 +6,7 @@ import {
   ensureDaemonProcessEnv,
   installDaemonLlmEnv,
   resetDaemonLlmInstallForTest,
+  unpinDaemonLlmProfile,
 } from "./daemon-llm";
 import { SECRET_FIELD, type DshSettings } from "./fields";
 import { DEFAULT_SETTINGS } from "./fields";
@@ -165,20 +166,29 @@ describe("the daemon's process environment", () => {
     expect(env[DAEMON_PROCESS_ENV.httpsProxy]).toBeUndefined();
   });
 
-  it("skips a disabled system proxy entirely, writing only the exemption and the budget", async () => {
+  it("skips a disabled system proxy entirely, writing neither mirror nor exemption", async () => {
+    // The regression this pins: the old code wrote NO_PROXY unconditionally, and with no proxy
+    // mirrored beside it the daemon's stack resolved DIRECT connections — the exact "bare
+    // NO_PROXY" death the pair exists to prevent, reached from the other side (a proxy that was
+    // read as absent rather than unknown). Silence about the proxy is silence about the exemption.
     const env = {} as NodeJS.ProcessEnv;
     await ensureDaemonProcessEnv(env, "darwin", proxyStub("<dictionary> { HTTPEnable : 0 }"));
     expect(env[DAEMON_PROCESS_ENV.httpProxy]).toBeUndefined();
-    expect(env[DAEMON_PROCESS_ENV.noProxy]).toBe("127.0.0.1,localhost");
+    expect(env[DAEMON_PROCESS_ENV.noProxy]).toBeUndefined();
+    expect(env[DAEMON_PROCESS_ENV.startupTimeout]).toBe("300");
   });
 
-  it("does not exec anything off macOS, where there is no scutil to ask", async () => {
+  it("does not exec anything off macOS, and writes no bare NO_PROXY it cannot pair", async () => {
+    // Off macOS there is no scutil to ask, so the proxy is UNKNOWN — and the exemption without a
+    // mirrored proxy would switch the daemon to direct connections on a machine whose only route
+    // out is an OS-configured proxy this cannot read. Nothing is written but the budget.
     const { exec, calls } = execRecorder("HTTPEnable : 1");
     const env = {} as NodeJS.ProcessEnv;
     await ensureDaemonProcessEnv(env, "linux", exec);
     expect(calls).toEqual([]);
     expect(env[DAEMON_PROCESS_ENV.httpProxy]).toBeUndefined();
-    expect(env[DAEMON_PROCESS_ENV.noProxy]).toBe("127.0.0.1,localhost");
+    expect(env[DAEMON_PROCESS_ENV.noProxy]).toBeUndefined();
+    expect(env[DAEMON_PROCESS_ENV.noProxyLower]).toBeUndefined();
   });
 
   it("never argues with an environment that already spoke", async () => {
@@ -198,7 +208,53 @@ describe("the daemon's process environment", () => {
     await ensureDaemonProcessEnv(env, "darwin", macOSProxy);
     expect(env[DAEMON_PROCESS_ENV.noProxy]).toBe("example.test,127.0.0.1,localhost");
   });
+
+  it("does not re-append the pair to an exemption that already names either loopback member", async () => {
+    // The old check looked for `127.0.0.1` only, so `NO_PROXY=localhost` got
+    // `127.0.0.1,localhost` appended — duplicating the `localhost` it already had. Either
+    // spelling of the loopback means "the user already exempted it"; their list stays verbatim.
+    const env = { [DAEMON_PROCESS_ENV.noProxy]: "localhost" } as NodeJS.ProcessEnv;
+    await ensureDaemonProcessEnv(env, "darwin", macOSProxy);
+    expect(env[DAEMON_PROCESS_ENV.noProxy]).toBe("localhost");
+  });
 });
 
 // Keep the type referenced so the import stays meaningful for the shape under test.
 const _settings: DshSettings | undefined = undefined;
+
+describe("unpinning the profile's persisted model", () => {
+  /** Records what unpin asks the CLI to do, without spawning anything. */
+  const recorder = (status = 0) => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    return {
+      calls,
+      spawn: (command: string, args: string[]) => {
+        calls.push({ command, args });
+        return { status };
+      },
+    };
+  };
+
+  it("asks the embed CLI to remove exactly the four variables this plugin writes", () => {
+    const { calls, spawn } = recorder();
+    expect(unpinDaemonLlmProfile("coding-agent", spawn)).toBe(true);
+    expect(calls).toHaveLength(4);
+    for (const name of Object.values(DAEMON_LLM_ENV)) {
+      expect(calls).toContainEqual({
+        command: "uvx",
+        args: ["hindsight-embed@latest", "profile", "remove-env", "coding-agent", name],
+      });
+    }
+  });
+
+  it("addresses the pinned embed version when the config names one", () => {
+    const { calls, spawn } = recorder();
+    unpinDaemonLlmProfile("coding-agent", spawn, "1.2.3");
+    expect(calls[0]?.args[0]).toBe("hindsight-embed@1.2.3");
+  });
+
+  it("reports failure rather than throwing when the CLI refuses", () => {
+    const { spawn } = recorder(1);
+    expect(unpinDaemonLlmProfile("coding-agent", spawn)).toBe(false);
+  });
+});

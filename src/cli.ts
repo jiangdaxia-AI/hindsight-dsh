@@ -2,33 +2,41 @@
  * `hindsight-dsh` — the same reports as `/hindsight`, from a shell.
  *
  * Why it exists next to the command: the questions this answers get asked when something is WRONG,
- * and the dsh that would run the command is sometimes the thing that is wrong (a plugin that
+ * and the dsh that would run the command is sometimes the thing that's wrong (a plugin that
  * failed to bind, a client half that never loaded). A CLI resolves the config from the same files
  * the plugin reads and talks to the same daemon, so it can be run when dsh cannot.
  *
  * It reads config exactly like the plugin does — `loadConfig` under the `dsh` harness id, plus the
  * `HINDSIGHT_HOST_OVERRIDES` layer a running host exports — and nothing here writes: every call is
  * a GET, and a token is never printed.
+ *
+ * THE TOKEN. The plugin's host keeps its settings-page token OUT of the inherited environment (it
+ * travels by the 0600 spawn-credentials file instead — see core/spawn-credentials.ts), so a shell
+ * does not have it either. But the CLI runs as the SAME USER the host does, and the same file is
+ * the plugin's own answer to "which credential do my children use": reading it here closes the one
+ * gap that would otherwise make the CLI answer 401 against an endpoint the plugin talks to freely
+ * (the CLI and the plugin resolve the same file; only the page's live layer is missing, and that
+ * layer's token is in the file). The file is read through the runtime's own helper, so an absent
+ * or cleared file contributes exactly nothing, and an exported HINDSIGHT_API_TOKEN still wins.
  */
 import { resolve } from "node:path";
 import { resolveHostMemory } from "../vendor/coding-agents/src/core/host-client";
-import { syncStatus } from "../vendor/coding-agents/src/core/status";
+import { spawnCredentialEnv } from "../vendor/coding-agents/src/core/spawn-credentials";
 import { HARNESS } from "./harness";
 import {
   HELP_TEXT,
   collectInspect,
-  createInspectApi,
+  describeInvalid,
   formatInspect,
+  inspectDepsOf,
   parseInspectInput,
-  type InspectDeps,
-  type InspectRequest,
 } from "./inspect";
 
 interface Args {
   json: boolean;
   help: boolean;
   cwd: string;
-  request: InspectRequest;
+  request: ReturnType<typeof parseInspectInput>;
 }
 
 /** Read the argv. Positional words are the command; the flags surround them. */
@@ -57,35 +65,36 @@ async function main(): Promise<number> {
     return 0;
   }
   if (args.request.kind === "invalid") {
-    // An empty `word` is a subcommand with nothing after it — see the command's own wording.
-    const problem = args.request.word === "" ? "missing an argument" : `unknown option "${args.request.word}"`;
-    console.error(`hindsight-dsh: ${problem}\n\n${HELP_TEXT}`);
+    // The shared wording — the command says exactly this for the same input.
+    console.error(`hindsight-dsh: ${describeInvalid(args.request)}\n\n${HELP_TEXT}`);
     return 2;
   }
 
   const directory = resolve(args.cwd);
   // Config, bank and client come from the runtime's own resolver, so the CLI answers about the same
   // bank a session in that directory would write to — including `paths.<prefix>`, `banks.<id>` and
-  // the `optInOnly` rules. Building it sends nothing.
-  const memory = resolveHostMemory(HARNESS, directory);
-  const deps: InspectDeps = {
-    api: createInspectApi(memory.client),
-    cfg: memory.cfg,
-    directory,
-    bankId: memory.bankId,
-    // Only a resolved bank has documents to summarise; a disabled or opted-out directory has none.
-    ...(memory.bankId === ""
-      ? {}
-      : { sync: () => syncStatus(memory.client, memory.bankId, directory) }),
-  };
-
-  const data = await collectInspect(deps, args.request);
-  if (data === null) {
-    console.log(HELP_TEXT);
-    return 0;
+  // the `optInOnly` rules. Building it sends nothing. The spawn-credentials file supplies the
+  // page's token the same way it supplies it to the plugin's own children (see the module comment);
+  // `loadConfig` ranks an exported variable above it, so a user's own export still wins.
+  const credentials = spawnCredentialEnv();
+  const saved: NodeJS.ProcessEnv = { ...process.env };
+  for (const [name, value] of Object.entries(credentials)) {
+    if (process.env[name] === undefined) process.env[name] = value;
   }
-  console.log(args.json ? JSON.stringify(data, null, 2) : formatInspect(data));
-  return 0;
+  try {
+    const memory = resolveHostMemory(HARNESS, directory);
+    const deps = inspectDepsOf(memory, directory);
+    const data = await collectInspect(deps, args.request);
+    if (data === null) {
+      console.log(HELP_TEXT);
+      return 0;
+    }
+    console.log(args.json ? JSON.stringify(data, null, 2) : formatInspect(data));
+    return 0;
+  } finally {
+    // The borrowed credential leaves with this process; nothing here writes it anywhere else.
+    process.env = saved;
+  }
 }
 
 main().then(

@@ -22,7 +22,8 @@ export const inject = ["slots", "locale", "configForms"];
 /** The slice of the browser Cordis context this plugin uses. */
 interface ClientContext {
   locale: {
-    bind(namespace: string): (key: string) => string;
+    /** Bound to one dictionary namespace; `params` fills `{name}` placeholders in the copy. */
+    bind(namespace: string): (key: string, params?: Record<string, unknown>) => string;
     register(namespace: string, dictionaries: Record<string, unknown>): () => void;
   };
   slots: {

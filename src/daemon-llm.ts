@@ -28,8 +28,9 @@
  * the resolved choice on every configuration refresh, so whichever process starts the daemon —
  * this one, or a later one reading the profile — resolves the same model.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawnSync as spawnSyncReal } from "node:child_process";
 import type { DaemonModel } from "./setup";
+import { log } from "../vendor/coding-agents/src/core/log";
 
 /** Field → environment variable. The names are the server's own; it reads them at startup. */
 export const DAEMON_LLM_ENV = {
@@ -159,9 +160,9 @@ export const DAEMON_PROCESS_ENV = {
 export interface DaemonProcessEnvWritten {
   /** The system proxy mirrored into the environment, if one had to be mirrored. */
   mirroredProxy?: string;
-  /** Set when the loopback proxy exemption was written. */
-  noProxy: true;
-  /** The startup budget the daemon will wait within. */
+  /** Set when the loopback proxy exemption was appended to a variable that lacked it. */
+  noProxy?: true;
+  /** The startup budget the daemon will wait within, as the environment now holds it. */
   startupTimeoutSeconds: string;
 }
 
@@ -242,7 +243,20 @@ export async function ensureDaemonProcessEnv(
       env[name] = suffix;
       return true;
     }
-    if (current.split(",").some((entry) => entry.trim() === "127.0.0.1")) return false;
+    // ANY member of the exemption counts as "the user already spoke": `NO_PROXY=localhost` and
+    // `NO_PROXY=127.0.0.1` both say "the loopback is exempt", and rewriting either to append the
+    // whole pair would duplicate the member it already had (the old check looked for
+    // `127.0.0.1` only, so a `localhost`-only exemption got `127.0.0.1,localhost` appended to
+    // its own `localhost`). Either spelling of the loopback present means leave the user's list
+    // exactly as they wrote it.
+    const members = new Set(
+      current
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry !== ""),
+    );
+    const suffixMembers = suffix.split(",").map((entry) => entry.trim());
+    if (suffixMembers.some((member) => members.has(member))) return false;
     env[name] = `${current},${suffix}`;
     return true;
   };
@@ -273,11 +287,26 @@ export async function ensureDaemonProcessEnv(
     mirroredProxy = wroteProxy ? system.https ?? system.http : undefined;
   }
 
-  // Both spellings, always: proxy resolution differs between them, and a short-circuit would
-  // leave the one this daemon's stack happens to read without its exemption.
-  const upperNoProxy = append(DAEMON_PROCESS_ENV.noProxy, loopback);
-  const lowerNoProxy = append(DAEMON_PROCESS_ENV.noProxyLower, loopback);
-  const wroteNoProxy = upperNoProxy || lowerNoProxy;
+  // Both spellings, always — but ONLY when a proxy route actually exists in the environment. The
+  // pair is the whole point (see the module comment): `NO_PROXY` alone does not "exempt the
+  // loopback", it switches Python's resolution from the system configuration to "environment
+  // only", and with no `*_proxy` variable beside it that means DIRECT connections. On a machine
+  // whose only route out is an OS-configured proxy this platform cannot read (no `scutil` off
+  // macOS; a failed exec answers the same "unknown"), the exemption would strand the daemon
+  // exactly the way 2026-10-15 did — so silence about the proxy is silence about the exemption
+  // too, and the loopback keeps whatever route the daemon's own stack resolves.
+  const proxyRouteExists =
+    userSpoke ||
+    env[DAEMON_PROCESS_ENV.httpProxy] !== undefined ||
+    env[DAEMON_PROCESS_ENV.httpsProxy] !== undefined ||
+    env[DAEMON_PROCESS_ENV.httpProxyLower] !== undefined ||
+    env[DAEMON_PROCESS_ENV.httpsProxyLower] !== undefined;
+  let wroteNoProxy = false;
+  if (proxyRouteExists) {
+    const upperNoProxy = append(DAEMON_PROCESS_ENV.noProxy, loopback);
+    const lowerNoProxy = append(DAEMON_PROCESS_ENV.noProxyLower, loopback);
+    wroteNoProxy = upperNoProxy || lowerNoProxy;
+  }
 
   const wroteTimeout = env[DAEMON_PROCESS_ENV.startupTimeout] === undefined;
   if (wroteTimeout) env[DAEMON_PROCESS_ENV.startupTimeout] = "300";
@@ -285,7 +314,16 @@ export async function ensureDaemonProcessEnv(
   const spokeEverything = userSpoke && !wroteNoProxy && !wroteTimeout;
   return spokeEverything
     ? undefined
-    : { ...(mirroredProxy ? { mirroredProxy } : {}), noProxy: true, startupTimeoutSeconds: "300" };
+    : {
+        ...(mirroredProxy ? { mirroredProxy } : {}),
+        // Set only when this call actually appended a member — a host reading this to decide
+        // whether to log "loopback exempted" must not be told so on a call that changed nothing.
+        ...(wroteNoProxy ? { noProxy: true } : {}),
+        // The budget as it stands in the environment, not the constant: a user who exported
+        // their own `HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT` keeps it, and the log line should
+        // say what the daemon will actually wait.
+        startupTimeoutSeconds: env[DAEMON_PROCESS_ENV.startupTimeout] ?? "300",
+      };
 }
 
 /**
@@ -295,4 +333,60 @@ export async function ensureDaemonProcessEnv(
  */
 export function resetDaemonLlmInstallForTest(): void {
   installed.clear();
+}
+
+/**
+ * Remove this plugin's model pins from the daemon profile's persisted `.env`.
+ *
+ * WHY THIS EXISTS. `installDaemonLlmEnv(undefined)` cleans the ENVIRONMENT of one process — but the
+ * starter (`daemon-start.ts` → `HindsightServer`) persists every `HINDSIGHT_API_*` it is handed
+ * into the profile's `.env` via `profile create --merge --env`, and merge only ever ADDS. So a
+ * cleared pick left four stale keys sitting in `~/.hindsight/profiles/<name>.env`, and the next
+ * daemon started by ANY other path — a hook-triggered spawn, a manual `hindsight-embed daemon
+ * start` — re-read them and came back on the retired model while the page showed the new
+ * resolution (2026-10-15: the exact drift `installDaemonLlmEnv` was built to close, surviving it
+ * through the profile file). `hindsight-embed profile remove-env <name> <key>` is the CLI's own
+ * way to take a key back out, so a cleared choice now unpins the profile too.
+ *
+ * Only the four variables THIS plugin ever writes are removed — a key the user put in the profile
+ * by hand keeps its standing, exactly as an exported environment variable does. The command needs
+ * `uvx`, so the profile a `--from <checkout>` run would target (a different embed version) is
+ * still addressed by NAME, which is what the daemon reads it by.
+ *
+ * Best-effort, like every spawn here: a missing `uvx` or a failed exec is one debug line, never a
+ * failed configuration refresh — the environment half has already cleaned itself by the time this
+ * runs, and the profile copy only matters to the NEXT spawn from elsewhere.
+ */
+export function unpinDaemonLlmProfile(
+  profile: string,
+  spawnSync: (command: string, args: string[]) => { status: number | null; stderr?: string } = defaultSpawnSync,
+  embedVersion?: string
+): boolean {
+  const pkg = embedVersion?.trim() ? `hindsight-embed@${embedVersion.trim()}` : "hindsight-embed@latest";
+  for (const name of Object.values(DAEMON_LLM_ENV)) {
+    try {
+      const result = spawnSync("uvx", [pkg, "profile", "remove-env", profile, name]);
+      if (result.status !== 0) {
+        log.debug(LOG_SCOPE, "profile remove-env failed", { profile, name, status: result.status });
+        return false;
+      }
+    } catch (error) {
+      log.debug(LOG_SCOPE, "profile remove-env failed", { profile, name, error: error instanceof Error ? error.message : String(error) });
+      return false;
+    }
+  }
+  return true;
+}
+
+/** The harness id this plugin logs under, for the debug lines a failed unpin leaves. */
+const LOG_SCOPE = "dsh";
+
+/** The exec `unpinDaemonLlmProfile` uses by default; wrapped so a test can stub it without spawning. */
+function defaultSpawnSync(command: string, args: string[]): { status: number | null; stderr?: string } {
+  try {
+    const result = spawnSyncReal(command, args, { timeout: 30_000 });
+    return { status: result.status, stderr: result.stderr?.toString() };
+  } catch (error) {
+    return { status: null, stderr: error instanceof Error ? error.message : String(error) };
+  }
 }

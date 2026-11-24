@@ -8,6 +8,7 @@
  * is skipped, when `field()` reports an override — so a controller test fails when that contract
  * changes. It is a double, not a substitute: it is not what ships, and it does not test the library.
  */
+import { createElement, Fragment, type ReactNode } from "react";
 import type {
   FieldSpec,
   FieldState,
@@ -240,8 +241,57 @@ export function settingsTextField(field: string): FieldSpec {
   };
 }
 
-/** Presentational components: inert here, since no test renders the section. */
-export const SettingsForm = (): undefined => undefined;
-export const SettingsValueField = (): undefined => undefined;
-export const SettingsSecretField = (): undefined => undefined;
-export const Switch = (): undefined => undefined;
+/**
+ * Presentational components.
+ *
+ * These render REAL structure — the label, the children, the accessible name, the state a test wants
+ * to read — because `section.test.ts` renders the settings page and asserts on what it built. They
+ * are still doubles: geometry, CSS and interaction belong to the library, and a change there is not
+ * something this file can notice.
+ */
+export const SettingsForm = (props: { children?: ReactNode }) => createElement(Fragment, null, props.children);
+
+export const SettingsValueField = (props: { label: string; hint?: string }) =>
+  createElement("div", { "data-field": props.label }, props.hint ?? null);
+
+export const SettingsSecretField = (props: { label: string }) => createElement("div", { "data-field": props.label });
+
+export const Switch = (props: { checked: boolean; label: string; disabled?: boolean }) =>
+  createElement("button", { "data-switch": props.label, "aria-checked": props.checked, disabled: props.disabled });
+
+export const Button = (props: {
+  icon?: ReactNode;
+  children?: ReactNode;
+  disabled?: boolean;
+  "aria-label"?: string;
+  onClick?: () => void;
+}) =>
+  createElement(
+    "button",
+    { "aria-label": props["aria-label"], disabled: props.disabled, onClick: props.onClick },
+    props.icon ?? null,
+    props.children ?? null,
+  );
+
+export const Tag = (props: { tone?: string; children?: ReactNode }) =>
+  createElement("span", { "data-tag": props.tone ?? "outline" }, props.children ?? null);
+
+export const StateDot = (props: { state: string }) => createElement("span", { "data-state": props.state });
+
+/** Attaches nothing: the real Tooltip clones its child, which a test has no reason to reproduce. */
+export const Tooltip = (props: { label: string; children?: ReactNode }) =>
+  createElement("span", { "data-tooltip": props.label }, props.children ?? null);
+
+/**
+ * The destructive-action dialog.
+ *
+ * Rendered as one element carrying every prop it was handed, because what a test must be able to
+ * read is what the page ASKED for — the warning text, the acknowledgement copy, whether it is open.
+ * The real dialog's focus trap, Escape handling and checkbox belong to the library.
+ */
+export const RiskConfirmation = (props: { open: boolean } & Record<string, unknown>) =>
+  createElement("div", { ...props, "data-confirmation": String(props.open) });
+
+/** Icons are vector artwork; a test only needs to see that the right one was placed. */
+export const IconRefreshOutlineRegular = () => createElement("span", { "data-icon": "refresh" });
+export const IconTrashOutlineRegular = () => createElement("span", { "data-icon": "trash" });

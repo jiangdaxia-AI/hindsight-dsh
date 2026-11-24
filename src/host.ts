@@ -1,9 +1,9 @@
 /**
  * The host half: this package's Cordis plugin.
  *
- * It is a thin shell around the shared Hindsight runtime, carried as a pinned copy under
- * `vendor/coding-agents` (upstream: `hindsight-integrations/coding-agents`, re-synced by
- * `scripts/sync-runtime.mjs`). Building the runtime again here would fork it, so the bundle inlines
+ * It is a thin shell around the shared Hindsight runtime, carried in-tree under
+ * `vendor/coding-agents` (forked from `hindsight-integrations/coding-agents`; pinned by
+ * `scripts/pin-runtime.mjs`). Building the runtime again here would fork it, so the bundle inlines
  * that source instead and this file adds the one thing a packaged integration cannot have: a
  * configuration surface the user can reach from inside dsh.
  *
@@ -35,17 +35,19 @@ import {
   inject as runtimeInject,
   setRuntimeConfigSource,
 } from "../vendor/coding-agents/src/dsh";
+import { writeFileSync } from "node:fs";
 import { HOST_OVERRIDES_ENV, loadConfig } from "../vendor/coding-agents/src/core/config";
 import { hasUvx, isServerHealthy, startDaemonDetached } from "../vendor/coding-agents/src/core/daemon";
 import { resolveHostMemory } from "../vendor/coding-agents/src/core/host-client";
 import { log } from "../vendor/coding-agents/src/core/log";
-import { syncStatus } from "../vendor/coding-agents/src/core/status";
+import { SPAWN_CREDENTIALS_PATH } from "../vendor/coding-agents/src/core/spawn-credentials";
 import { registerHindsightCommand, type CommandScope } from "./command";
+import { handleLibraryRequest, LIBRARY_ROUTE, type BankAdminDeps } from "./bank-admin";
 import { DEFAULT_SETTINGS, NAMESPACE, type DshSettings } from "./fields";
 import { HARNESS } from "./harness";
-import { createInspectApi, type InspectDeps } from "./inspect";
+import { inspectDepsOf, type InspectDeps } from "./inspect";
 import { Config, toRuntimeConfig } from "./settings";
-import { applyDaemonLlmEnv, ensureDaemonProcessEnv, installDaemonLlmEnv } from "./daemon-llm";
+import { applyDaemonLlmEnv, ensureDaemonProcessEnv, installDaemonLlmEnv, unpinDaemonLlmProfile } from "./daemon-llm";
 import { ensureUvOnPath } from "./uv";
 import {
   harnessFacts,
@@ -138,6 +140,37 @@ export function readSettings(config: unknown): Partial<DshSettings> {
 }
 
 /**
+ * The token the settings carry, trimmed; undefined when the page has none.
+ *
+ * The one credential the host half resolves for its children. It never enters the exported
+ * overrides layer (see `publishHostOverrides`); this is the value `publishSpawnCredentials` writes.
+ */
+function apiTokenOf(settings: Partial<DshSettings>): string | undefined {
+  const token = settings.apiToken?.trim();
+  return token ? token : undefined;
+}
+
+/**
+ * Record the credential this plugin's own children should carry, in the 0600 file they read at
+ * their spawn boundary (see core/spawn-credentials.ts).
+ *
+ * Best-effort by design: a directory this cannot write is a machine whose shared config already
+ * carries the token, and a child that finds no file falls back to its own config sources — the
+ * failure mode is the pre-file behaviour, not a crash. Written on every configuration refresh so
+ * a cleared page token clears the file too.
+ *
+ * Exported for the test that proves a cleared setting clears the file.
+ */
+export function publishSpawnCredentials(apiToken: string | undefined): void {
+  try {
+    const body = apiToken === undefined ? "" : JSON.stringify({ apiToken });
+    writeFileSync(SPAWN_CREDENTIALS_PATH, body, { mode: 0o600 });
+  } catch {
+    /* best-effort: children fall back to the shared config file */
+  }
+}
+
+/**
  * The setup request this host has not acted on yet.
  *
  * The page writes a fresh nonce per click, so a CHANGED value is a request and an unchanged one is
@@ -163,6 +196,30 @@ interface HostContext {
   /** The plugin's own fiber, which owns the settings presentation policy. */
   fiber?: unknown;
   readonly logger?: { error?: (message: unknown) => void };
+}
+
+/**
+ * The Host's connection service, to the extent this plugin uses it.
+ *
+ * Structural, like every other dsh surface this plugin touches: no dsh package is imported at build
+ * time, so this half keeps loading against a composition that lacks the service entirely. The
+ * `fetch` registry is the carrier-neutral exact-route table the web transport mounts under `/api`;
+ * requests that reach a registered route have already passed the Host/Origin fence and the browser
+ * session's cookie authentication, which is why the page can call it with a plain same-origin
+ * `fetch` and why nothing here checks a credential of its own.
+ */
+interface ConnectionScope {
+  connection?: {
+    fetch?: {
+      register(route: {
+        path: string;
+        methods: string[];
+        requestBody: "buffered" | "streaming";
+        fetch(request: Request): Promise<Response>;
+      }): unknown;
+    };
+  };
+  effect?(callback: () => (() => void) | void, label?: string): unknown;
 }
 
 /**
@@ -233,7 +290,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
   try {
     setRuntimeConfigSource(source);
     /**
-     * Hand this process's resolved layer to every child it spawns.
+     * Hand this process's resolved layer to every child it spawns — CREDENTIALS EXCEPTED.
      *
      * deepen, the survey supervisor and the survey's MCP server each re-read configuration in
      * their own process, where only the shared file and this environment are visible. The user's
@@ -241,9 +298,18 @@ export function apply(ctx: HostContext, config?: unknown): void {
      * background ingest to the Cloud default and 401s it while the interactive turns keep talking
      * to the local daemon. Refreshed with `source` on every volatile write, so a settings change
      * reaches the next child without a restart.
+     *
+     * `apiToken` is stripped before the export: this variable travels by INHERITANCE, so every
+     * descendant of this host sees it — including the test runners and scripts the AGENT spawns in
+     * its sessions, which are not this plugin's to trust with a credential. The token instead goes
+     * to a 0600 file the Hindsight children read at their spawn boundary (see
+     * `publishSpawnCredentials` below and core/spawn-credentials.ts): a `node -e
+     * "process.env.HINDSIGHT_HOST_OVERRIDES"` in any session comes back credential-free.
      */
     const publishHostOverrides = (): void => {
-      process.env[HOST_OVERRIDES_ENV] = JSON.stringify(source());
+      const { apiToken: _redacted, ...layer } = source();
+      process.env[HOST_OVERRIDES_ENV] = JSON.stringify(layer);
+      publishSpawnCredentials(apiTokenOf(readSettings(config)));
     };
     publishHostOverrides();
     /** The last setup request this process has acted on; an unchanged value is not a new request. */
@@ -306,6 +372,14 @@ export function apply(ctx: HostContext, config?: unknown): void {
      * starts exactly as it would have without this — on the profile's own configuration — and the
      * next refresh installs the choice for the spawn after it.
      */
+    /**
+     * The model this refresh last installed, so a later one can tell a CLEAR from a no-op.
+     *
+     * `installDaemonLlmEnv(undefined)` is a valid answer ("nothing resolved"), and the unpin below
+     * must not fire for it — only a model that EXISTED and then went away unpins the profile.
+     */
+    let lastInstalledModel: { provider?: string; model?: string } | undefined;
+
     const refreshDaemonModelEnv = (): void => {
       void (async () => {
         try {
@@ -316,7 +390,21 @@ export function apply(ctx: HostContext, config?: unknown): void {
         try {
           const model =
             (await modelFromChoice(readSettings(config), harnessFactsHere())) ?? (await harnessModel(harnessLookup()));
+          const previous = lastInstalledModel;
           installDaemonLlmEnv(model);
+          lastInstalledModel = model ?? undefined;
+          // A CLEARED pick must unpick the profile too, not only this process's environment: the
+          // starter persists every HINDSIGHT_API_* into the profile's .env, and `--merge` never
+          // removes — so without this the next spawn from anywhere else (a hook, a manual
+          // `hindsight-embed daemon start`) re-read the retired model while the page showed the
+          // new resolution. Only the four variables this plugin ever writes are taken back out;
+          // the daemon itself is NOT restarted, because "no model resolved" is not a model change
+          // a running service must act on.
+          if (model === undefined && previous !== undefined) {
+            // The profile name as the running config resolves it — the same resolution the
+            // starter uses, so the unpin addresses the profile the next spawn will read.
+            unpinDaemonLlmProfile(loadConfig({ harness: HARNESS, overrides: source() }).daemonProfile);
+          }
         } catch {
           /* the daemon keeps whatever environment it already had; the page's setup still runs */
         }
@@ -492,14 +580,8 @@ export function apply(ctx: HostContext, config?: unknown): void {
      */
     const inspectFor = (directory: string): InspectDeps => {
       const memory = resolveHostMemory(HARNESS, directory, toRuntimeConfig(readSettings(config)));
-      return {
-        api: createInspectApi(memory.client),
-        cfg: memory.cfg,
-        directory,
-        bankId: memory.bankId,
-        // No resolved bank means nothing to summarise (disabled, or opted out in this directory).
-        ...(memory.bankId === "" ? {} : { sync: () => syncStatus(memory.client, memory.bankId, directory) }),
-      };
+      // The shared builder, so the command and the CLI cannot drift on what a report's deps are.
+      return inspectDepsOf(memory, directory);
     };
 
     /** Where an asking agent works. dsh records it on the session header; a session without one is
@@ -515,6 +597,64 @@ export function apply(ctx: HostContext, config?: unknown): void {
     // memory. A plain registration is global, so this one row serves every agent preset.
     ctx.inject?.(["commands"], (child) => {
       registerHindsightCommand((child ?? ctx) as CommandScope, { directoryOf, inspectFor });
+    });
+
+    /**
+     * Everything the settings page's library list needs, resolved per request.
+     *
+     * `process.cwd()` rather than a session's directory: the page asks about the whole SERVER, and
+     * the directory only decides which bank this process would write to — which the list does not
+     * use. It matters in one case, though: with `optInOnly` set, an un-opted directory resolves to
+     * "disabled", and the resolved config still carries the endpoint, so the list works there too
+     * and the page says memory is off for this process.
+     */
+    const libraryDeps = (): BankAdminDeps => {
+      const memory = resolveHostMemory(HARNESS, process.cwd(), toRuntimeConfig(readSettings(config)));
+      return {
+        transport: () => memory.client,
+        serverMode: () => memory.cfg.serverMode,
+        disabled: () => memory.cfg.disabled,
+      };
+    };
+
+    // WHERE THE PAGE ASKS ABOUT ITS LIBRARIES. The settings document carries CONFIGURATION and this
+    // is not configuration: a refresh would have to write a bank list into the profile's own config
+    // file, and a delete has no honest spelling as a settings write. So this half registers one
+    // exact Fetch route on the Host's connection service — the route registry the web transport
+    // always provides — and the browser half calls it with a document-relative `fetch`, under the
+    // same origin and the same session cookie the page itself was served with.
+    //
+    // Optional, like `settings` and `commands`: a composition without a web transport (a headless
+    // run, the CLI) simply has no route, and the page renders its "unavailable" state instead of
+    // waiting forever for an answer that cannot come.
+    ctx.inject?.(["connection"], (child) => {
+      const scope = (child ?? ctx) as ConnectionScope;
+      const register = scope.connection?.fetch?.register;
+      if (typeof register !== "function") {
+        log.debug(HARNESS, "no connection route registry in this composition; the library list is off");
+        return;
+      }
+      scope.effect?.(
+        () => {
+          // The registry wraps the registration in an effect on the READING context — the same
+          // child fiber this run is on — so disposal is already owned. Nothing is returned here
+          // because `register`'s own return value is the registry's business, not this plugin's.
+          register({
+            path: LIBRARY_ROUTE,
+            // One path, two meanings: GET lists, POST removes. Both are answered as JSON with a 200
+            // for a failure the page should SHOW (an unreachable server) — see bank-admin.ts.
+            methods: ["GET", "POST"],
+            requestBody: "buffered",
+            fetch: (request) => handleLibraryRequest(request, libraryDeps()),
+          });
+          // One line next to the bind line, for the reason that line exists: "did the page's list
+          // get a route at all" is otherwise only answerable from inside a session. Written after
+          // the registration, so the line means the route IS there rather than that it was asked
+          // for — a registry that refuses the path leaves no such line.
+          log.info(HARNESS, "hindsight library route registered", { path: LIBRARY_ROUTE });
+        },
+        "hindsight: library route"
+      );
     });
 
     // A volatile-only write updates the config references in place, so reading through this same

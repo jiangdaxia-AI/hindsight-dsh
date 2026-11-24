@@ -16,11 +16,13 @@
 /** Where the setup currently is. `idle` means nothing has run in this profile yet. */
 export type SetupPhase = "idle" | "running" | "ok" | "failed";
 
-/** The steps, in the order the runner performs them. */
-export type SetupStepId = "uv" | "model" | "service";
+/** The steps the runner performs, as the client can localize them. */
+export const SETUP_STEP_IDS = ["uv", "model", "service"] as const;
+export type SetupStepId = (typeof SETUP_STEP_IDS)[number];
 
-/** Why a run ended, as a code the client localizes. */
-export type SetupCode = "ok" | "uv-missing" | "model-missing" | "unhealthy" | "not-daemon" | "error";
+/** The codes a run can end with, as the client can localize them. */
+export const SETUP_CODES = ["ok", "uv-missing", "model-missing", "unhealthy", "not-daemon", "error"] as const;
+export type SetupCode = (typeof SETUP_CODES)[number];
 
 /** One finished step: what it did, in one line the page shows verbatim. */
 export interface SetupStepState {
@@ -63,6 +65,15 @@ export function parseSetupStatus(raw: unknown): SetupStatus | undefined {
     const candidate = value as Partial<SetupStatus>;
     if (typeof candidate.at !== "number" || typeof candidate.phase !== "string") return undefined;
     if (!["idle", "running", "ok", "failed"].includes(candidate.phase)) return undefined;
+    // `code` and `step` localize through fixed keys (`setupReason.${code}`, `setupStep.${step}`):
+    // an unknown value from a newer host must not reach the page, where it renders as a bare key
+    // the user cannot read. Dropped, not substituted — the phase still says what happened.
+    if (candidate.code !== undefined && !(SETUP_CODES as readonly string[]).includes(candidate.code)) {
+      candidate.code = undefined;
+    }
+    if (candidate.step !== undefined && !(SETUP_STEP_IDS as readonly string[]).includes(candidate.step)) {
+      candidate.step = undefined;
+    }
     return {
       at: candidate.at,
       phase: candidate.phase as SetupPhase,
