@@ -23,12 +23,27 @@ function target(entry: string | { default?: string } | undefined): string | unde
   return entry?.default;
 }
 
+/**
+ * Whether npm would pack this export target — it must sit inside one of the `files` entries.
+ *
+ * Deliberately a wiring question, not an existence one: a fresh checkout has no build artifacts,
+ * and `pnpm test` must pass there. That the artifact a build produces really exists is
+ * `scripts/check-contract.mjs`'s job, which runs after `pnpm run build`.
+ */
+function shipped(file: string): boolean {
+  const relative = file.replace(/^\.\//, "");
+  return pkg.files.some((entry) => {
+    const dir = entry.replace(/\/$/, "");
+    return relative === dir || relative.startsWith(`${dir}/`);
+  });
+}
+
 describe("package contract", () => {
   it("declares the browser half the client module system looks for", () => {
     expect(pkg.dsh?.client?.platform).toBe("web");
     const client = target(pkg.exports["./client"]);
     expect(client).toBe("./lib/client.js");
-    expect(existsSync(join(root, client!))).toBe(true);
+    expect(shipped(client!)).toBe(true);
   });
 
   it("ships both halves in the published files", () => {
@@ -38,7 +53,7 @@ describe("package contract", () => {
     expect(pkg.files).toContain("lib");
     expect(pkg.files).toContain("cordis.patch.yml");
     expect(target(pkg.exports["."])).toBe("./dist/host.js");
-    expect(existsSync(join(root, "dist/host.js"))).toBe(true);
+    expect(shipped("./dist/host.js")).toBe(true);
   });
 
   it("routes every profile through the manifest-declared patch", () => {
