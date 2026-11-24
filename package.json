@@ -58,6 +58,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
     "record-runtime": "node scripts/pin-runtime.mjs --record",
     "check-runtime": "node scripts/pin-runtime.mjs --check",
     "check-contract": "node scripts/check-contract.mjs",

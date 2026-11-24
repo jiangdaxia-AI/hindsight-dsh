@@ -66,10 +66,16 @@
 
 ## 安装
 
-**从 npm 安装**（通过 pnpm 装进单个 profile）：
+**从 GitHub 安装**（源码安装，不需要 NPM 包；`prepare` 会构建两半）：
 
 ```sh
-dsh plugin --profile <profile> add hindsight-dsh
+dsh plugin --profile web add github:jiangdaxia-AI/hindsight-dsh
+```
+
+**从 npm 安装**（发布之后）：
+
+```sh
+dsh plugin --profile web add hindsight-dsh
 ```
 
 包内声明了 `dsh.bundle.patch`，profile 会自动拾取 Loader 行，不需要改别的。重启 dsh，或让运行中的实例通过配置监听器应用改动。

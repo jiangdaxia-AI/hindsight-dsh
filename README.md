@@ -83,10 +83,16 @@ A handover document built from memory: six fact searches merged into one report,
 
 ## Install
 
-**From npm** (installs into one profile through pnpm):
+**From GitHub** (source install — no npm package needed; the `prepare` script builds both halves):
 
 ```sh
-dsh plugin --profile <profile> add hindsight-dsh
+dsh plugin --profile web add github:jiangdaxia-AI/hindsight-dsh
+```
+
+**From npm** (once the package is published):
+
+```sh
+dsh plugin --profile web add hindsight-dsh
 ```
 
 The package declares `dsh.bundle.patch`, so the profile picks the Loader row up automatically;
