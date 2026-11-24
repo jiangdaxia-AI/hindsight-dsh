@@ -19,42 +19,6 @@
 - **默认本地。** 新 profile 默认 `daemon` 模式，在本机按需启动 Hindsight 服务，不需要任何账号。
 - **可观察。** `/hindsight` 和 `hindsight-dsh` 会报告当前目录解析到哪个记忆库、里面有什么、是否健康——只读，且不消耗模型轮次。
 
-## 截图
-
-### 设置页
-
-| | |
-|---|---|
-| ![设置页：每个项目单独的记忆库](docs/images/settings-per-project-memory.png) | ![本地服务直接跟随 dsh 的模型](docs/images/settings-reuse-dsh-model.png) |
-| 每个项目单独的记忆库——事实数、会话数、最后写入时间，以及唯一的破坏性操作。 | 本地服务可以直接跟随 dsh 正在用的模型，不用再配第二份 key。 |
-
-![连接：本地守护进程、自建服务或 Hindsight Cloud](docs/images/settings-cloud.png)
-
-### 会话中
-
-![会话开始时异步检索历史上下文](docs/images/session-async-retrieval.png)
-
-会话打开时异步检索历史上下文，匹配当前目标的知识页在第一个提问之前就到位。
-
-| | |
-|---|---|
-| ![记忆块注入到这一轮](docs/images/auto-use-during-turn.png) | ![按需加载 hindsight 工具](docs/images/tools-on-demand.png) |
-| 记忆块注入到这一轮里，并在一开始就说明相关性判断规则。 | 智能体工作时按需加载 `hindsight_*` 工具。 |
-
-![工作推进时写入并更新事实](docs/images/facts-updated-over-time.png)
-
-工作推进的同时写入、更新事实——工具结果里会带回文档 id。
-
-### 结果与交接
-
-![回答引用过去的决策与日期](docs/images/past-decisions-in-results.png)
-
-回答会引用过去的决策和根因，并带上当时的日期。
-
-![用记忆生成的交接文档](docs/images/project-handover.png)
-
-用记忆做项目交接：6 次事实检索合并成一份报告，479 行扩到 529 行。
-
 ## 环境要求
 
 | | |
@@ -165,9 +129,6 @@ dsh 压缩上下文 ── session/event ─▶ 被丢弃的片段保留为 comp
 运行时本身位于 `vendor/coding-agents/`，从
 [`hindsight-integrations/coding-agents`](https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/coding-agents)
 分叉而来，现在**就是这个包自己的源码**：改它是本仓库的普通改动，由 `scripts/pin-runtime.mjs` 守护并重新钉住（`--record`），而不是从别处同步。
-
-完整设计——两个预算的算术、项目库卡片、运行时边界的不变量、以及完整故障排查表——见 **[docs/reference.md](docs/reference.md)**（英文）。
-
 ## 查看记忆
 
 记忆从外部本来是看不见的：插件往服务器上的记忆库写，智能体自己的 `hindsight_*` 工具是唯一的窗口——必须模型主动去问。另有两个入口把这些只读报告直接交给你：
@@ -207,7 +168,6 @@ hindsight · dsh memory
 | `vendor/coding-agents/` | coding-agent 记忆运行时，随树携带，构建时内联。 |
 | `scripts/` | 构建、运行时钉住、打包契约检查。 |
 | `preview/` | 设置页改版前后的截图与对比页。 |
-| `docs/reference.md` | 完整设计与故障排查参考（英文）。 |
 
 ## 开发
 
@@ -235,7 +195,7 @@ pnpm run check-contract  # 构建后：manifest、产物与 `files` 一致
 | 某个会话没有记忆，但日志看起来干净 | 用 `hindsight-dsh doctor`：绑定行只在绑定**完成**时写入，它缺失（或显示 `FAILED`）本身就是故障。 |
 | 首个提问卡一两分钟后才回答 | 被等待的 `agent/pre-step` 在等一个模型线路很慢的 reflect 归纳。单个步骤最多等 `reflectPatienceMs`；除非你接受这份延迟，否则不要调大。 |
 
-插件日志是 `~/.hindsight/coding-agents-logs/plugin.log`（用 `HINDSIGHT_LOG_FILE` 覆盖），每个进程开头有一行说明生效的模式。`node dist/cli.js doctor` 不需要 dsh 在跑也能打印同样的信息。更多条目——以及「macOS 不装 Homebrew 时处理 OpenSSL」的做法——见 [docs/reference.md](docs/reference.md#troubleshooting)。
+插件日志是 `~/.hindsight/coding-agents-logs/plugin.log`（用 `HINDSIGHT_LOG_FILE` 覆盖），每个进程开头有一行说明生效的模式。`node dist/cli.js doctor` 不需要 dsh 在跑也能打印同样的信息。
 
 ## 许可证
 

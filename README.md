@@ -35,43 +35,6 @@ by a model, and retrieved on demand — without the user ever configuring a memo
 - **Visible.** `/hindsight` and `hindsight-dsh` report which bank a repository resolves to, what is
   in it, and whether it is healthy — read-only, without spending a model turn.
 
-## Screenshots
-
-### Settings page
-
-| | |
-|---|---|
-| ![Settings → Hindsight: one memory bank per project](docs/images/settings-per-project-memory.png) | ![The local server follows dsh's own model](docs/images/settings-reuse-dsh-model.png) |
-| One memory bank per project — facts, sessions and last write, with the one destructive action. | The local server can follow the model dsh is already using, so there is no second key to configure. |
-
-![Connection: local daemon, a server you run, or Hindsight Cloud](docs/images/settings-cloud.png)
-
-### In a session
-
-![Historical context retrieved asynchronously at session start](docs/images/session-async-retrieval.png)
-
-A session opens: historical context is retrieved asynchronously, and the knowledge pages that match
-the goal arrive before the first prompt.
-
-| | |
-|---|---|
-| ![The memory block injected into the turn](docs/images/auto-use-during-turn.png) | ![The hindsight tools loaded on demand](docs/images/tools-on-demand.png) |
-| The memory block is injected into the turn, with the relevance rule stated up front. | The `hindsight_*` tools are loaded on demand while the agent works. |
-
-![Facts written and updated as work happens](docs/images/facts-updated-over-time.png)
-
-Facts are written and updated as the work happens — the tool result comes back with the document id.
-
-### Results and handover
-
-![Answers cite past decisions with their dates](docs/images/past-decisions-in-results.png)
-
-Answers cite the past decisions and root causes behind them, with the date they were recorded.
-
-![A handover document built from memory](docs/images/project-handover.png)
-
-A handover document built from memory: six fact searches merged into one report, 479 → 529 lines.
-
 ## Requirements
 
 | | |
@@ -203,9 +166,6 @@ and now **this package's own source**: a change to it is an ordinary change here
 `scripts/pin-runtime.mjs` guards that source and re-pins it (`--record`) rather than pulling it from
 anywhere.
 
-The full design — the two budgets in arithmetic, the project-libraries card, the runtime boundary
-invariants, and the troubleshooting table — is in **[docs/reference.md](docs/reference.md)**.
-
 ## Inspecting memory
 
 Memory is otherwise invisible from the outside: the plugin writes to a bank on a server, and the
@@ -254,7 +214,6 @@ application's binary in Node mode, and prefers a real `node` when one exists.
 | `vendor/coding-agents/` | The coding-agent memory runtime, carried in-tree and inlined at build time. |
 | `scripts/` | Build, runtime pinning, and the packaging contract checks. |
 | `preview/` | The settings page's before/after screenshots and comparison page. |
-| `docs/reference.md` | The full design and troubleshooting reference. |
 
 ## Development
 
@@ -288,8 +247,6 @@ and this README — not `vendor/` or `src/`, which are build-time only.
 The plugin's log is `~/.hindsight/coding-agents-logs/plugin.log` (override with
 `HINDSIGHT_LOG_FILE`), and it starts with one line per process naming the mode in force.
 `node dist/cli.js doctor` prints the same picture without needing dsh to be running.
-More rows — and the macOS-without-Homebrew OpenSSL recipe — are in
-[docs/reference.md](docs/reference.md#troubleshooting).
 
 ## License
 
