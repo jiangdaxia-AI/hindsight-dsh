@@ -19,6 +19,42 @@
 - **默认本地。** 新 profile 默认 `daemon` 模式，在本机按需启动 Hindsight 服务，不需要任何账号。
 - **可观察。** `/hindsight` 和 `hindsight-dsh` 会报告当前目录解析到哪个记忆库、里面有什么、是否健康——只读，且不消耗模型轮次。
 
+## 截图
+
+### 设置页
+
+| | |
+|---|---|
+| ![设置页：每个项目单独的记忆库](docs/images/settings-per-project-memory.png) | ![本地服务直接跟随 dsh 的模型](docs/images/settings-reuse-dsh-model.png) |
+| 每个项目单独的记忆库——事实数、会话数、最后写入时间，以及唯一的破坏性操作。 | 本地服务可以直接跟随 dsh 正在用的模型，不用再配第二份 key。 |
+
+![连接：本地守护进程、自建服务或 Hindsight Cloud](docs/images/settings-cloud.png)
+
+### 会话中
+
+![会话开始时异步检索历史上下文](docs/images/session-async-retrieval.png)
+
+会话打开时异步检索历史上下文，匹配当前目标的知识页在第一个提问之前就到位。
+
+| | |
+|---|---|
+| ![记忆块注入到这一轮](docs/images/auto-use-during-turn.png) | ![按需加载 hindsight 工具](docs/images/tools-on-demand.png) |
+| 记忆块注入到这一轮里，并在一开始就说明相关性判断规则。 | 智能体工作时按需加载 `hindsight_*` 工具。 |
+
+![工作推进时写入并更新事实](docs/images/facts-updated-over-time.png)
+
+工作推进的同时写入、更新事实——工具结果里会带回文档 id。
+
+### 结果与交接
+
+![回答引用过去的决策与日期](docs/images/past-decisions-in-results.png)
+
+回答会引用过去的决策和根因，并带上当时的日期。
+
+![用记忆生成的交接文档](docs/images/project-handover.png)
+
+用记忆做项目交接：6 次事实检索合并成一份报告，479 行扩到 529 行。
+
 ## 环境要求
 
 | | |
@@ -64,6 +100,8 @@ dsh plugin --profile <profile> add "$PWD"
 3. **服务** —— 启动分离的守护进程，并轮询 `/health` 直到它应答。
 
 随后卡片会报告结果：就绪（给出服务地址和选中的模型），或失败（给出原因和重试）。指向 `self-hosted` 或 `cloud` 的 profile 会看到同一张卡片，按钮会切回本地服务并完成初始化。
+
+> **建议用 flash 模型。** 事实抽取与整合是高频、短上下文的调用，用便宜、快的 **flash 系列**模型就够——例如 `qwen3.8-flash`、`hy4-flash` 等。可以在本地服务的模型字段里直接指定，也可以留空让它跟随 dsh 正在用的模型。旗舰模型每轮成本更高，但在抽取这件事上收益很小。
 
 ## 配置
 

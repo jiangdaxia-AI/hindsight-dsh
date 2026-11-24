@@ -35,6 +35,43 @@ by a model, and retrieved on demand — without the user ever configuring a memo
 - **Visible.** `/hindsight` and `hindsight-dsh` report which bank a repository resolves to, what is
   in it, and whether it is healthy — read-only, without spending a model turn.
 
+## Screenshots
+
+### Settings page
+
+| | |
+|---|---|
+| ![Settings → Hindsight: one memory bank per project](docs/images/settings-per-project-memory.png) | ![The local server follows dsh's own model](docs/images/settings-reuse-dsh-model.png) |
+| One memory bank per project — facts, sessions and last write, with the one destructive action. | The local server can follow the model dsh is already using, so there is no second key to configure. |
+
+![Connection: local daemon, a server you run, or Hindsight Cloud](docs/images/settings-cloud.png)
+
+### In a session
+
+![Historical context retrieved asynchronously at session start](docs/images/session-async-retrieval.png)
+
+A session opens: historical context is retrieved asynchronously, and the knowledge pages that match
+the goal arrive before the first prompt.
+
+| | |
+|---|---|
+| ![The memory block injected into the turn](docs/images/auto-use-during-turn.png) | ![The hindsight tools loaded on demand](docs/images/tools-on-demand.png) |
+| The memory block is injected into the turn, with the relevance rule stated up front. | The `hindsight_*` tools are loaded on demand while the agent works. |
+
+![Facts written and updated as work happens](docs/images/facts-updated-over-time.png)
+
+Facts are written and updated as the work happens — the tool result comes back with the document id.
+
+### Results and handover
+
+![Answers cite past decisions with their dates](docs/images/past-decisions-in-results.png)
+
+Answers cite the past decisions and root causes behind them, with the date they were recorded.
+
+![A handover document built from memory](docs/images/project-handover.png)
+
+A handover document built from memory: six fact searches merged into one report, 479 → 529 lines.
+
 ## Requirements
 
 | | |
@@ -87,6 +124,11 @@ Open **Settings → Hindsight**. The first card sets up local memory with one bu
 The card then reports what happened: ready, with the service URL and the model it chose; or failed,
 with the reason and a retry. A profile pointed at `self-hosted` or `cloud` shows the same card with a
 button that switches to the local service and sets it up.
+
+> **Use a flash model.** Fact extraction and consolidation are frequent, short-context calls, so a
+> cheap, fast **flash-series** model is the right choice — `qwen3.8-flash`, `hy4-flash`, and the
+> like. Name one in the local server's model field, or leave it blank to follow the model dsh is
+> already using. A flagship model costs more per turn and buys little on extraction.
 
 ## Configure
 
