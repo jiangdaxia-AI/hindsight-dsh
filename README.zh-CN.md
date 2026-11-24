@@ -224,7 +224,15 @@ pnpm run check-contract  # 构建后：manifest、产物与 `files` 一致
 
 如果构建需要一个 `package.json` 里没声明的包，会在这里失败，而不是在用户第一次提问时失败。随树的运行时是*打包*而非*解析*的：安装是一次链接加一次复制，profile 的模块系统里没有需要查找的东西。
 
-**发布**是 `pnpm run build && npm publish`。`files` 只发布 `dist`、`lib`、`cordis.patch.yml` 和本 README——不发布 `vendor/` 或 `src/`，它们是构建期产物。
+**发布**在 CI 里由 tag 触发，仓库里不存在任何 npm token：
+
+```sh
+git tag v0.1.2 && git push origin v0.1.2
+```
+
+`.github/workflows/publish.yml` 会重跑所有守卫、构建，然后用 `--provenance` 发布。npm 通过 **OpenID Connect** 信任这个工作流：runner 签发一个短期身份令牌，npm 拿它和包上配置的可信发布方比对，凭证随任务结束作废。如果仓库名或工作流文件名改了，必须回 npm 重新配置——这组配对就是信任本身。
+
+`files` 只发布 `dist`、`lib`、`cordis.patch.yml` 和本 README——不发布 `vendor/` 或 `src/`，它们是构建期产物。
 
 ## 故障排查
 

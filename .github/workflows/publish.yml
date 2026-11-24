@@ -1,0 +1,70 @@
+name: publish
+
+# Publishes to npm from a tag, with no stored credential.
+#
+# npm trusts this workflow through OpenID Connect: the runner presents a short-lived identity
+# token, npm verifies it against the trusted publisher configured on the package, and issues a
+# credential that expires with the job. Nothing secret lives in this repository, and no
+# bypass-2FA token has to exist at all. The pairing must agree — the repository and workflow
+# filename below are what npm has on file, and a rename here means re-configuring there.
+#
+#   git tag v0.1.2 && git push origin v0.1.2
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # the whole mechanism: lets the job mint the OIDC token npm verifies
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      # Trusted publishing needs an npm that speaks OIDC (>= 11.5.1); the Node image ships an
+      # older one. Deliberately NOT `registry-url`, which would write an .npmrc expecting a
+      # NODE_AUTH_TOKEN that must not exist here.
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The same guards test.yml runs, because a published bundle is frozen: it inlines the
+      # runtime, so whatever ships cannot be fixed without another release.
+      - name: Check the vendored runtime
+        run: pnpm run check-runtime
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build both halves
+        run: pnpm run build
+
+      - name: Contract check
+        run: pnpm run check-contract
+
+      # No NODE_AUTH_TOKEN and no setup-node registry: npm detects the OIDC environment on its
+      # own and exchanges it for a credential. --provenance attaches the signed build record
+      # that makes the published tarball traceable to this commit.
+      - name: Publish to npm
+        run: npm publish --provenance --access public

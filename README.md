@@ -273,8 +273,20 @@ A build that needs a package `package.json` does not declare fails here, not at 
 prompt. The vendored runtime is *bundled*, not resolved: an install is a link and a copy, with
 nothing for a profile's module system to look up.
 
-**Publishing** is `pnpm run build && npm publish`. `files` ships `dist`, `lib`, `cordis.patch.yml`
-and this README — not `vendor/` or `src/`, which are build-time only.
+**Publishing** happens in CI, from a tag — there is no npm token anywhere:
+
+```sh
+git tag v0.1.2 && git push origin v0.1.2
+```
+
+`.github/workflows/publish.yml` re-runs every guard, builds, and publishes with `--provenance`.
+npm trusts the workflow through **OpenID Connect**: the runner mints a short-lived identity token,
+npm checks it against the trusted publisher configured on the package, and the credential dies with
+the job. A rename of the repository or of the workflow file has to be re-configured on npm, since
+that pairing is the trust.
+
+`files` ships `dist`, `lib`, `cordis.patch.yml` and this README — not `vendor/` or `src/`, which are
+build-time only.
 
 ## Troubleshooting
 
