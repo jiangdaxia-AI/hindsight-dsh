@@ -10,7 +10,16 @@
     "memory",
     "agent-memory"
   ],
+  "author": "jiangdaxia",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiangdaxia-AI/hindsight-dsh.git"
+  },
+  "homepage": "https://github.com/jiangdaxia-AI/hindsight-dsh#readme",
+  "bugs": {
+    "url": "https://github.com/jiangdaxia-AI/hindsight-dsh/issues"
+  },
   "type": "module",
   "bin": {
     "hindsight-dsh": "./dist/cli.js"
@@ -49,8 +58,8 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "sync-runtime": "node scripts/sync-runtime.mjs",
-    "check-runtime": "node scripts/sync-runtime.mjs --check",
+    "record-runtime": "node scripts/pin-runtime.mjs --record",
+    "check-runtime": "node scripts/pin-runtime.mjs --check",
     "check-contract": "node scripts/check-contract.mjs",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
@@ -59,6 +68,7 @@
   "devDependencies": {
     "@deepseek-ai/schemastery": "~3.18.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@rolldown/binding-wasm32-wasi": "1.2.13",
     "@types/node": "^26.1.0",
     "@types/react": "^19.2.0",
     "@vectorize-io/hindsight-all": "^0.10.2",

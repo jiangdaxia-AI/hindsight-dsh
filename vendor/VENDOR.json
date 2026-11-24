@@ -1,10 +1,11 @@
 {
-  "upstream": {
+  "origin": {
     "package": "@vectorize-io/hindsight-coding-agents",
     "version": "0.8.1",
-    "commit": "ff9d09dd54ab8977e0901aeeae18f7db164511b0"
+    "commit": "ff9d09dd54ab8977e0901aeeae18f7db164511b0",
+    "note": "Forked from hindsight-integrations/coding-agents and now first-party source of this package; the tree MAY differ from this revision by design (see scripts/pin-runtime.mjs)."
   },
-  "fileCount": 74,
-  "inventory": "7f66dddb598855651bcd28f19bb3fbeaf7052463e0bd0eaecfcde77047446726",
-  "syncedAt": "2026-10-14T09:55:01.256Z"
+  "fileCount": 81,
+  "inventory": "04ea496acdb242e9640a2685ddac60e396f04b5eb80a12aead4d66ebdc9062c6",
+  "recordedAt": "2026-10-16T09:48:33.128Z"
 }

@@ -191,10 +191,23 @@ export function daemonEnv(
   // caller that just wrote those (the dsh settings page owns a provider, endpoint, model and key of
   // its own) would otherwise be silently overruled by whatever key happens to sit in the
   // environment: the user saves `deepseek` and the daemon runs `openai`.
+  //
+  // The guess must also MATCH the statement before it may fill a key. `detectLlm` itself returns
+  // early when a provider was stated (the statement is the whole answer it owes), so the probe for
+  // a matching key runs HERE, against the probe table, only for the provider that was named. The
+  // bug this closes: a provider was stated but no key was (a local gateway that needs none) while
+  // some OTHER tool's credential sat in the environment, and the old fill handed the gateway a key
+  // belonging to a different provider — auth failing on a route that was open before the "help".
   const llm = detectLlm(env);
   if (llm) {
     if (out.HINDSIGHT_API_LLM_PROVIDER === undefined) out.HINDSIGHT_API_LLM_PROVIDER = llm.provider;
-    if (llm.apiKey && out.HINDSIGHT_API_LLM_API_KEY === undefined) out.HINDSIGHT_API_LLM_API_KEY = llm.apiKey;
+    if (out.HINDSIGHT_API_LLM_API_KEY === undefined) {
+      const stated = out.HINDSIGHT_API_LLM_PROVIDER;
+      const probe = PROVIDER_PROBES.find((p) => p.provider === stated);
+      const key = probe ? env[probe.keyEnv]?.trim() : undefined;
+      if (key) out.HINDSIGHT_API_LLM_API_KEY = key;
+      else if (llm.apiKey && llm.provider === stated) out.HINDSIGHT_API_LLM_API_KEY = llm.apiKey;
+    }
   }
   return out;
 }

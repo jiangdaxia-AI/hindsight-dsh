@@ -279,6 +279,16 @@ export const DEFAULT_RECALL_OPTIONS: Record<string, unknown> = {
 };
 
 /** How long drain() pauses between poll cycles when the API did not rate-limit (429). */
+/**
+ * The deadline EVERY request gets unless its caller names a tighter one.
+ *
+ * `req` applies it through `AbortSignal.timeout`, and `fetchWithAuth` swaps in a dispatcher that drops
+ * undici's own header/body timeouts, so this one number is the sole authority on how long a stalled
+ * server can hold a call. Callers on a latency-critical path (the awaited `agent/pre-step`) pass their
+ * own, smaller budget rather than inheriting it.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
 const POLL_CYCLE_MS = 5000;
 
 /** Consecutive 5xx polls after which drain() gives an operation up as failed. A blip recovers in
@@ -469,7 +479,7 @@ export class HindsightClient {
     url: string,
     body?: unknown,
     tolerate: number[] = [],
-    timeoutMs = 15_000
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
   ): Promise<Response> {
     // Hard cap on EVERY request: a stalled server (pool deadlock, network) must degrade to a
     // memoryless turn — never hang a host that awaits us (opencode blocks its BOOT on plugin init).
@@ -792,9 +802,19 @@ export class HindsightClient {
       // Cycle backoff: default 5s; any 429 in the cycle raises it to the longest Retry-After seen
       // (floor 10s) so a rate-limited API gets room to recover before the next poll round.
       let backoffMs = POLL_CYCLE_MS;
+      // One deadline per POLL, not per drain: without a signal a stalled server parks a single
+      // GET on undici's default 300s headers timeout, and the maxMs loop condition cannot
+      // interrupt an await that never settles — one hung poll could eat the whole budget while
+      // every OTHER op sat unpolled behind the pool.
+      const remainingMs = start + maxMs - Date.now();
+      const pollDeadline = Math.max(1, Math.min(POLL_CYCLE_MS * 2, remainingMs));
+      const pollSignal = AbortSignal.timeout(pollDeadline);
       await pool([...pending], this.maxParallelRetains, async (id) => {
         try {
-          const r = await this.fetchWithAuth(this.bankUrl(`/operations/${id}`), { method: "GET" });
+          const r = await this.fetchWithAuth(this.bankUrl(`/operations/${id}`), {
+            method: "GET",
+            signal: pollSignal,
+          });
           if (r.status === 429) {
             backoffMs = Math.min(
               RETRY_AFTER_CEILING_MS,
@@ -841,13 +861,14 @@ export class HindsightClient {
    * tool's configured window and aborted every high-budget synthesis mid-flight (#3590).
    */
   async reflect(query: string, opts: { budget?: string; timeoutMs: number }): Promise<string> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+    // The same deadline idiom `req` uses, rather than a hand-rolled AbortController + timer: it needs
+    // nothing cleared, and `aborted` below still says whether OUR deadline or the server ended it.
+    const signal = AbortSignal.timeout(opts.timeoutMs);
     try {
       const resp = await this.fetchWithAuth(this.bankUrl("/reflect"), {
         method: "POST",
         body: JSON.stringify({ query, budget: opts.budget ?? "high" }),
-        signal: ctrl.signal,
+        signal,
       });
       // Keep the server's body: a bare "reflect 500" in the diag trail is undebuggable after the fact.
       if (!resp.ok)
@@ -860,13 +881,11 @@ export class HindsightClient {
       return (data.text || "").trim();
     } catch (e) {
       // Our own deadline surfaces as a generic "This operation was aborted"; name it.
-      if (ctrl.signal.aborted)
+      if (signal.aborted)
         throw new ReflectError(`reflect timed out after ${opts.timeoutMs}ms`, undefined, true, {
           cause: e,
         });
       throw e;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -926,9 +945,9 @@ export class HindsightClient {
    * The bank's knowledge-base tree (folders + pages, nested). The tree carries names, source
    * queries and staleness but NOT synthesized content, so it is cheap enough to poll.
    */
-  async tree(): Promise<KnowledgeNode[]> {
+  async tree(timeoutMs?: number): Promise<KnowledgeNode[]> {
     if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
-    const r = await this.req("GET", this.bankUrl("/knowledge-base/tree"));
+    const r = await this.req("GET", this.bankUrl("/knowledge-base/tree"), undefined, [], timeoutMs);
     if (await this.pagesUnsupported(r)) throw new KnowledgePagesUnavailableError();
     // Bank not created yet: it genuinely has no pages, and the capability stays UNKNOWN so the
     // next call (after the first retain mints the bank) asks again instead of short-circuiting.
@@ -949,8 +968,12 @@ export class HindsightClient {
    * NOTE the ids are knowledge-base node ids (`kp-…`), NOT the backing mental-model ids. Every
    * page read/update in this client goes through the same knowledge-base ids, so a page id from
    * here, from `searchKnowledgePages`, or from a `[[page:<id>]]` link all resolve identically.
+   *
+   * `timeoutMs` is the caller's deadline. A caller on a host's critical path names its own budget
+   * here, because the default is sized for a request nobody is waiting on (see
+   * `DEFAULT_REQUEST_TIMEOUT_MS`): the roster is a nice-to-have for the turn, never the memory itself.
    */
-  async listPages(): Promise<unknown> {
+  async listPages(opts?: { timeoutMs?: number }): Promise<unknown> {
     const items: { id: string; name: string; description?: string; folder?: string }[] = [];
     const walk = (nodes: KnowledgeNode[], folder?: string): void => {
       for (const n of nodes) {
@@ -966,7 +989,7 @@ export class HindsightClient {
         if (n.children?.length) walk(n.children, n.kind === "folder" ? n.name : folder);
       }
     };
-    walk(await this.tree());
+    walk(await this.tree(opts?.timeoutMs));
     return { items };
   }
 

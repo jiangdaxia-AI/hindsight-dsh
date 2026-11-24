@@ -1,21 +1,23 @@
 /**
- * Tests for `scripts/sync-runtime.mjs` — the pinning and boundary guard.
+ * Tests for `scripts/pin-runtime.mjs` — the pin and boundary guard over the OWNED runtime.
  *
- * WHY THESE EXIST. The script is this package's only defence against the vendored runtime drifting:
- * it is what CI trusts to notice a hand-edited copy, and what stops a re-sync from writing a tree
- * that cannot build. That makes it the worst place in the repository to have untested behaviour —
- * a guard that silently stops guarding is indistinguishable from no guard at all, and both look
- * like a green CI run.
+ * WHY THESE EXIST. The tree under `vendor/coding-agents` is this package's own source now, and the
+ * script is the only thing standing between "a deliberate change" and "a stray edit nobody noticed":
+ * CI trusts it to notice that the tree moved off its pin, and it is the command that moves the pin
+ * when the move was intended. That makes it the worst place in the repository to have untested
+ * behaviour — a guard that silently stops guarding is indistinguishable from no guard at all, and
+ * both look like a green CI run.
  *
  * HERMETIC BY CONSTRUCTION. The script derives the tree it owns from its own location, so each test
  * builds a throwaway project in a temp directory — a copy of the real script and a copy of the real
- * `vendor/` — and points it at a throwaway upstream. Nothing here touches the working tree, which
- * matters because every assertion below is about files being rewritten or deliberately not.
+ * tree — and, where the comparison needs one, a throwaway hindsight checkout. Nothing here touches
+ * the working tree, which matters because every assertion below is about files being rewritten or
+ * deliberately not. It also means this suite FAILS when the real tree is not pinned to itself, which
+ * is the intended way to notice that a change still needs `--record`.
  */
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -32,7 +34,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(HERE, "..");
 const REAL_VENDOR = join(PACKAGE_ROOT, "vendor");
 
-/** Files `sync-runtime` insists upstream provides; content is irrelevant to these tests. */
+/** Files a hindsight checkout provides; content is irrelevant to these tests. */
 const UPSTREAM_ENTRIES = [
   "dsh.ts",
   "daemon-start.ts",
@@ -49,7 +51,7 @@ afterEach(() => {
 });
 
 function tempDir(label) {
-  const dir = mkdtempSync(join(tmpdir(), `sync-runtime-${label}-`));
+  const dir = mkdtempSync(join(tmpdir(), `pin-runtime-${label}-`));
   cleanups.push(dir);
   return dir;
 }
@@ -61,7 +63,7 @@ function tempDir(label) {
 function makeProject() {
   const root = tempDir("project");
   mkdirSync(join(root, "scripts"), { recursive: true });
-  cpSync(join(HERE, "sync-runtime.mjs"), join(root, "scripts", "sync-runtime.mjs"));
+  cpSync(join(HERE, "pin-runtime.mjs"), join(root, "scripts", "pin-runtime.mjs"));
   cpSync(REAL_VENDOR, join(root, "vendor"), { recursive: true });
   return root;
 }
@@ -89,7 +91,7 @@ function makeUpstream({ extraCore = {} } = {}) {
 /** Run the script in `project`, returning its exit code and output instead of throwing. */
 function run(project, args) {
   try {
-    const stdout = execFileSync(process.execPath, [join(project, "scripts", "sync-runtime.mjs"), ...args], {
+    const stdout = execFileSync(process.execPath, [join(project, "scripts", "pin-runtime.mjs"), ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -158,91 +160,119 @@ describe("checking the vendored runtime", () => {
 
     const result = run(project, ["--check"]);
     expect(result.code).toBe(1);
-    expect(result.output).toContain("is not vendored");
+    expect(result.output).toContain("is not in the bundled set");
   });
 });
 
-describe("syncing from upstream", () => {
-  it("copies the file set and pins it", () => {
+describe("recording a deliberate change", () => {
+  /**
+   * The point of `--record`: the runtime is this package's own source now, so changing it is an
+   * ordinary change — and moving the pin onto that change has to be one command, or the pin starts
+   * reading as an obstacle to work around by editing the manifest.
+   */
+  it("re-pins a deliberately edited tree", () => {
     const project = makeProject();
-    const upstream = makeUpstream();
+    const victim = join(project, "vendor", "coding-agents", "src", "core", "log.ts");
+    writeFileSync(victim, `${readFileSync(victim, "utf8")}\n// a deliberate local change\n`);
 
-    const result = run(project, ["--from", upstream]);
+    expect(run(project, ["--check"]).code).toBe(1);
+
+    const result = run(project, ["--record"]);
     expect(result.code).toBe(0);
-    expect(existsSync(join(project, "vendor", "coding-agents", "src", "core", "log.ts"))).toBe(true);
-
-    // The generated package.json carries the UPSTREAM version, because the runtime reads it for
-    // the User-Agent it sends. This package's own version would be a lie.
-    const generated = JSON.parse(readFileSync(join(project, "vendor", "coding-agents", "package.json"), "utf8"));
-    expect(generated.version).toBe("9.9.9");
-
+    expect(result.output).toContain("pins as it stands");
     expect(run(project, ["--check"]).code).toBe(0);
   });
 
-  it("takes a file upstream has added", () => {
+  it("takes a file the tree has added", () => {
     const project = makeProject();
-    const upstream = makeUpstream({ extraCore: { "brand-new.ts": "export const added = 1;\n" } });
+    const added = join(project, "vendor", "coding-agents", "src", "core", "brand-new.ts");
+    writeFileSync(added, "export const added = 1;\n");
 
-    expect(run(project, ["--from", upstream]).code).toBe(0);
-    expect(existsSync(join(project, "vendor", "coding-agents", "src", "core", "brand-new.ts"))).toBe(true);
+    expect(run(project, ["--record"]).code).toBe(0);
+    expect(run(project, ["--check"]).code).toBe(0);
   });
 
   /**
-   * Regression: the boundary used to be checked AFTER the copy, so a refused sync still left the
-   * new files in the tree with a stale lock beside them. A sync that cannot be trusted must not
-   * have written anything.
+   * Regression, carried over from the copy path this replaces: the boundary used to be checked AFTER
+   * the write, so a refused run still left the tree changed with a stale pin beside it. A record that
+   * cannot be trusted must not have written anything — including the lock.
    */
   it("writes nothing at all when the boundary would be broken", () => {
     const project = makeProject();
-    const upstream = makeUpstream({
-      extraCore: { "escape.ts": 'import { x } from "../cline";\nexport const probe = x;\n' },
-    });
+    writeFileSync(
+      join(project, "vendor", "coding-agents", "src", "core", "escape.ts"),
+      'import { x } from "../cline";\nexport const probe = x;\n',
+    );
     const before = snapshotVendor(project);
+    const lockBefore = readFileSync(join(project, "vendor", "VENDOR.json"), "utf8");
 
-    const result = run(project, ["--from", upstream]);
+    const result = run(project, ["--record"]);
     expect(result.code).toBe(1);
-    expect(result.output).toContain("nothing was written");
+    expect(result.output).toContain("nothing was recorded");
 
-    // Byte-for-byte identical, and the lock still valid: the tree is exactly as it was.
+    // Byte-for-byte identical, the lock included: the tree is exactly as it was.
     expect(snapshotVendor(project)).toEqual(before);
-    expect(run(project, ["--check"]).code).toBe(0);
+    expect(readFileSync(join(project, "vendor", "VENDOR.json"), "utf8")).toBe(lockBefore);
   });
 
   /**
-   * Regression: `syncedAt` was rewritten on every run, so re-syncing an unchanged upstream always
-   * produced a diff. A no-op sync has to be a no-op.
+   * Regression, carried over: the timestamp used to be rewritten on every run, so a no-op rewrote
+   * the pin and every no-op showed up as a diff. `recordedAt` describes the CONTENT.
    */
-  it("leaves the lock byte-identical when upstream has not changed", () => {
+  it("leaves the lock byte-identical when nothing changed", () => {
     const project = makeProject();
-    const upstream = makeUpstream();
+    const before = readFileSync(join(project, "vendor", "VENDOR.json"), "utf8");
 
-    expect(run(project, ["--from", upstream]).code).toBe(0);
-    const first = readFileSync(join(project, "vendor", "VENDOR.json"), "utf8");
-
-    expect(run(project, ["--from", upstream]).code).toBe(0);
-    const second = readFileSync(join(project, "vendor", "VENDOR.json"), "utf8");
-
-    expect(second).toBe(first);
-    expect(JSON.parse(second).syncedAt).toBe(JSON.parse(first).syncedAt);
+    expect(run(project, ["--record"]).code).toBe(0);
+    expect(readFileSync(join(project, "vendor", "VENDOR.json"), "utf8")).toBe(before);
   });
 
+  it("refuses to record an empty tree", () => {
+    const project = makeProject();
+    rmSync(join(project, "vendor", "coding-agents"), { recursive: true, force: true });
+
+    const result = run(project, ["--record"]);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("refusing to record nothing");
+  });
+
+  it("refuses contradictory modes", () => {
+    const project = makeProject();
+    expect(run(project, ["--check", "--record"]).code).toBe(1);
+    expect(run(project, ["--record", "--from", tempDir("upstream")]).code).toBe(1);
+  });
+
+  /**
+   * There is no longer a mode that copies a runtime in from a checkout. Saying so is the whole
+   * behaviour: a silent no-op would leave a maintainer believing the tree had been replaced.
+   */
+  it("explains itself instead of copying when called with no mode", () => {
+    const project = makeProject();
+    const result = run(project, []);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("no longer copies a runtime");
+  });
+});
+
+describe("comparing the owned tree against upstream", () => {
   it("refuses a checkout that is not a hindsight checkout", () => {
     const project = makeProject();
-    const result = run(project, ["--from", tempDir("empty")]);
+    const result = run(project, ["--check", "--from", tempDir("empty")]);
     expect(result.code).toBe(1);
     expect(result.output).toContain("could not find a hindsight checkout");
   });
 
   /**
-   * Regression: a checkout with the entry file but no manifest used to be accepted, and the sync
-   * then died on an ENOENT from the copy loop instead of saying the checkout was incomplete.
+   * Regression: a checkout with the entry file but no manifest used to be accepted, and the run
+   * then died on an ENOENT from deep inside the copy loop instead of saying the checkout was
+   * incomplete. The refusal is the same now that the comparison, not a copy, is what follows it.
    */
   it("refuses a checkout with no upstream package.json", () => {
     const project = makeProject();
     const upstream = makeUpstream();
     rmSync(join(upstream, "hindsight-integrations", "coding-agents", "package.json"));
 
-    const result = run(project, ["--from", upstream]);
+    const result = run(project, ["--check", "--from", upstream]);
     expect(result.code).toBe(1);
     expect(result.output).toContain("the checkout is incomplete");
     expect(result.output).not.toContain("ENOENT");
@@ -274,10 +304,29 @@ describe("comparing the copy against upstream", () => {
     expect(result.output).toContain("differs from upstream");
   });
 
+  /**
+   * Regression: the forward direction walked EVERY file the tree carries, so a file this repository
+   * added (the runtime is owned source now) was reported as one it had LOST — "no longer exists
+   * upstream — re-check COPY_FILES", advice about a copy list that no longer copies. A local test
+   * file also collided by name with an upstream one and was reported as differing from it.
+   */
+  it("does not report this tree's own additions as files it lost", () => {
+    const project = makeProject();
+    const upstream = makeUpstream();
+    writeFileSync(
+      join(project, "vendor", "coding-agents", "src", "core", "ours.ts"),
+      "export const ours = 1;\n",
+    );
+
+    const result = run(project, ["--check", "--from", upstream]);
+
+    expect(result.output).not.toContain("no longer exists upstream");
+    expect(result.output).not.toContain("auto-inject.test.ts"); // no test file is ever compared
+  });
+
   it("notices a vendored package.json that lost the upstream version", () => {
     const project = makeProject();
     const upstream = makeUpstream();
-    expect(run(project, ["--from", upstream]).code).toBe(0);
     writeFileSync(
       join(project, "vendor", "coding-agents", "package.json"),
       `${JSON.stringify({ name: "@vectorize-io/hindsight-coding-agents", version: "0.0.1" }, null, 2)}\n`,
@@ -303,7 +352,7 @@ describe("the generated package.json", () => {
 
     const result = run(project, ["--check"]);
     expect(result.code).toBe(1);
-    expect(result.output).toContain("is not vendored");
+    expect(result.output).toContain("is not in the bundled set");
   });
 
   it("accepts the real ../../package.json import", () => {
@@ -313,7 +362,7 @@ describe("the generated package.json", () => {
 
     const result = run(project, ["--check"]);
     // The inventory still covers the edit, so re-pin it and check the boundary is happy.
-    expect(result.output).not.toContain("is not vendored");
+    expect(result.output).not.toContain("is not in the bundled set");
     expect(result.output).not.toContain("COPY_DIRS");
   });
 

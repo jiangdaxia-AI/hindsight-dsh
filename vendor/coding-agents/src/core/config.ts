@@ -142,6 +142,25 @@ export interface RawConfig {
    *  it, fits the 30s prompt-hook timeout the installer registers on hook harnesses; going higher
    *  there needs that host timeout raised too, or the host kills the hook mid-reflect. */
   reflectTimeoutMs?: number;
+  /**
+   * How long ONE step waits for that session's automatic synthesis before it injects the cheap
+   * retrieval instead and lets the synthesis finish in the background (default 5000).
+   *
+   * Deliberately a different question from `reflectTimeoutMs`, and the two used to be one knob.
+   * `reflectTimeoutMs` says how long the synthesis may take to SUCCEED — on a slow model route that
+   * has to be minutes, or no synthesis ever lands. This one says how long the USER is made to wait
+   * for it, which is a per-turn cost and has to be seconds. Sharing one value meant that raising it
+   * so a slow synthesis could succeed also made every FAILING synthesis cost the user those same
+   * minutes: in this repo's own diag trail that was 471s of a 657s total spent waiting, while 95%
+   * of the successful syntheses returned in under a second.
+   *
+   * 0 = never wait: the step gets the retrieval source immediately, and the synthesis is delivered
+   * on a later step of the same turn (or a later turn) if it succeeds. Applies to hosts that can
+   * deliver later — this plugin, and the persistent-plugin hosts. Hook harnesses exit WITH the turn,
+   * so nothing could deliver a late synthesis to them and they keep waiting the whole
+   * `reflectTimeoutMs`; see core/synthesis.ts.
+   */
+  reflectPatienceMs?: number;
   /** Timeout for the agent-invoked `hindsight_reflect` tool (default 330000). Deliberately its own
    *  knob and much larger than `reflectTimeoutMs`: that one bounds an automatic hook that must fit
    *  the host's hook window, whereas this one bounds a call the agent made on purpose and waits on,
@@ -150,9 +169,11 @@ export interface RawConfig {
    *  server decides when to give up, not an arbitrary client deadline (#3590). Unset, it inherits
    *  an explicitly-raised `reflectTimeoutMs` — a user who raised that meant "let reflect run". */
   reflectToolTimeoutMs?: number;
-  /** Retrieval timeout for autoInject "pages"/"recall" (default 7000), and the shared budget for
-   *  the page-search -> recall fallback after a reflect timeout/5xx. On hook harnesses, the full
-   *  reflect + fallback must fit the host's prompt-hook timeout (30s by default). */
+  /** Retrieval timeout for autoInject "pages"/"recall" (default 7000), the shared budget for the
+   *  page-search -> recall fallback after a reflect timeout/5xx, and the budget for the per-turn
+   *  knowledge-page roster fetch — everything the automatic injection pulls from the server, so one
+   *  number bounds how long a stalled endpoint can hold a turn. On hook harnesses, the full reflect
+   *  + fallback must fit the host's prompt-hook timeout (30s by default). */
   injectTimeoutMs?: number;
   /** Reflect budget for the `hindsight_reflect` tool: "low" | "mid" | "high" (default "high").
    *  Drop to "mid"/"low" on a large bank where high-budget synthesis exceeds the server's wall
@@ -369,6 +390,7 @@ export interface Config {
   codeFactMaxChars: number;
   maxParallelRetains: number;
   reflectTimeoutMs: number;
+  reflectPatienceMs: number;
   reflectToolTimeoutMs: number;
   injectTimeoutMs: number;
   reflectBudget: "low" | "mid" | "high";
@@ -531,6 +553,10 @@ function resolveCustomPages(raw: RawConfig["customPages"]): CustomPagesConfig {
 
 /** Default timeout for the automatic hook reflect — see RawConfig.reflectTimeoutMs. */
 export const DEFAULT_REFLECT_TIMEOUT_MS = 20_000;
+/** Default per-step wait for that reflect — see RawConfig.reflectPatienceMs. 5s keeps ~95% of
+ *  successful syntheses on the step that asked for them (measured: 38 of 40 in this repo's own diag
+ *  trail returned in under a second) while capping a failing one at 5s instead of its whole timeout. */
+export const DEFAULT_REFLECT_PATIENCE_MS = 5_000;
 /** Default timeout for the agent-invoked `hindsight_reflect` tool — see RawConfig.reflectToolTimeoutMs. */
 export const DEFAULT_REFLECT_TOOL_TIMEOUT_MS = 330_000;
 /** Default retrieval budget for automatic injection — see RawConfig.injectTimeoutMs. */
@@ -706,6 +732,8 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     defaultBankConfig: resolveDefaultBankConfig(raw.defaultBankConfig),
     maxParallelRetains: raw.maxParallelRetains || 10,
     reflectTimeoutMs: raw.reflectTimeoutMs || DEFAULT_REFLECT_TIMEOUT_MS,
+    // `??`, not `||`: 0 is a meaningful value here ("never make the user wait"), not an absent one.
+    reflectPatienceMs: raw.reflectPatienceMs ?? DEFAULT_REFLECT_PATIENCE_MS,
     // Inherit an explicitly-raised reflectTimeoutMs (that is what users reaching for a longer
     // reflect already set), but never let it LOWER the tool below the default — a short window is
     // set to bound the automatic hook, not to cut off a call the agent is waiting on.
@@ -872,6 +900,7 @@ const ENV_KEYS = {
   codeFactMaxChars: "HINDSIGHT_CODE_FACT_MAX_CHARS",
   maxParallelRetains: "HINDSIGHT_MAX_PARALLEL_RETAINS",
   reflectTimeoutMs: "HINDSIGHT_REFLECT_TIMEOUT_MS",
+  reflectPatienceMs: "HINDSIGHT_REFLECT_PATIENCE_MS",
   reflectToolTimeoutMs: "HINDSIGHT_REFLECT_TOOL_TIMEOUT_MS",
   injectTimeoutMs: "HINDSIGHT_INJECT_TIMEOUT_MS",
   reflectBudget: "HINDSIGHT_REFLECT_BUDGET",
@@ -923,6 +952,7 @@ const ENV_NUMBERS = new Set<keyof RawConfig>([
   "daemonIdleTimeout",
   "maxParallelRetains",
   "reflectTimeoutMs",
+  "reflectPatienceMs",
   "reflectToolTimeoutMs",
   "injectTimeoutMs",
   "pageSearchLimit",
@@ -1103,11 +1133,18 @@ function resolvePartial(cfg: Config, patch: RawConfig): Partial<Config> {
   // `apiUrl` is derived from `serverMode` + `apiPort`, so an override naming any of the three
   // re-derives all three against the current cfg: `{ serverMode: "daemon" }` alone must also move
   // the URL to the local daemon, and `{ apiUrl }` under a global daemon mode stays ignored.
+  //
+  // The fallback for `apiUrl` keys on the PATCH's mode, not the global cfg's: the effective URL
+  // (derived or not) is the service the process talks to TODAY, and only a patch that moves to
+  // daemon mode has a better answer (the port). Keying on the global mode instead — dropping
+  // cfg.apiUrl whenever the GLOBAL was daemon — resolved a bank section saying only
+  // `{ "serverMode": "self-hosted" }` onto the CLOUD default, silently repointing that bank's
+  // memory at a different service.
   if ("serverMode" in patch || "apiUrl" in patch || "apiPort" in patch) {
     const conn = resolveConfig({
       serverMode: patch.serverMode ?? cfg.serverMode,
       apiPort: patch.apiPort ?? cfg.apiPort,
-      apiUrl: patch.apiUrl ?? (cfg.serverMode === "daemon" ? undefined : cfg.apiUrl),
+      apiUrl: patch.apiUrl ?? (patch.serverMode === "daemon" ? undefined : cfg.apiUrl),
     });
     out.serverMode = conn.serverMode;
     out.apiUrl = conn.apiUrl;

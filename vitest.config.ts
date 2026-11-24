@@ -13,9 +13,10 @@ export default defineConfig({
     },
   },
   test: {
-    // `src` is the plugin; `scripts` holds the vendoring guard, whose failure modes are silent
-    // enough that it needs its own tests (see scripts/sync-runtime.test.mjs).
-    include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
+    // `src` is the plugin; `scripts` holds the runtime guard, whose failure modes are silent enough
+    // that it needs its own tests (see scripts/pin-runtime.test.mjs); `vendor/coding-agents` is the
+    // runtime this package OWNS, so its tests live beside the modules they cover.
+    include: ["src/**/*.test.ts", "vendor/**/*.test.ts", "scripts/**/*.test.mjs"],
     environment: "node",
   },
 });

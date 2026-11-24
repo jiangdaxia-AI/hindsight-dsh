@@ -4,12 +4,20 @@
  * prompt behavior to the same core lifecycle as fresh-process hook harnesses; this class keeps only
  * the host-specific injection, toast, and incremental-transcript responsibilities.
  *
- * A harness adapter feeds it three normalized events and reads two values back:
+ * A harness adapter feeds it three normalized events and reads values back:
  *   - seedIfCold(repoPath)          : plugin load -> cold-check auto-seed (the page preamble is
- *                                     NOT computed here; onPrompt builds it per session)
- *   - onPrompt(sessionId, prompt)   : each user turn -> recall + build this turn's injection
- *   - getInjection(sessionId)       : the system-prompt text to inject this turn (or undefined)
+ *                                     NOT computed here; stepContext builds it per session)
+ *   - stepContext(sessionId, prompt): EVERY step -> this step's injection, and the only way a
+ *                                     synthesis that outlived its step's wait is ever delivered
+ *   - disposeSession(sessionId)     : the host disposed the session -> forget its local state
  *   - toolSpecs()                   : the hindsight_* knowledge/recall tools to register natively
+ *
+ * WHY ONE CALL PER STEP AND NOT PER PROMPT. The adapter used to ask twice — `onPrompt` to run the
+ * recall, `getInjection` to collect it — and only on steps that carried a prompt, on the assumption
+ * that a tool continuation already had the block in its history. That assumption is false the
+ * moment the memory is allowed to arrive LATE, which is exactly what makes a slow synthesis cheap:
+ * the block a continuation needs has not been injected anywhere yet. One call per step, prompt or
+ * not, is the smallest interface that can express both.
  *   - onTranscript(sessionId, turns, lastTurnComplete): full transcript -> write back (on by default)
  *   - onSessionIdle(sessionId)      : assistant finished -> refetch + write back the completed
  *                                     exchange (the Stop-equivalent these hosts lack)
@@ -17,6 +25,7 @@
  * No opencode/claude specifics live here — only the memory logic.
  */
 import type { Config } from "./config";
+import { AutoInject } from "./auto-inject";
 import { maybeAutoUpdate } from "./auto-update";
 import { DAEMON_WAIT_RETAIN_MS, DAEMON_WAIT_SESSION_START_MS, ensureDaemon } from "./daemon";
 import { diag } from "./diag";
@@ -31,15 +40,14 @@ import { memoryUsageCursorStore, recordUsage } from "./usage";
 import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
 import { syncCompanionSkill } from "./skill-sync";
-import { buildHookOutput } from "./hook";
-import { sessionCacheFile, writeSessionCache } from "./session-cache";
+import { buildStepOutput } from "./hook";
+import { readSessionCache, sessionCacheFile, writeSessionCache } from "./session-cache";
 
 const HARNESS = "opencode";
 /** How long `flush` holds a host's exit for in-flight write-backs: room for one retain request. */
 const FLUSH_TIMEOUT_MS = 10_000;
 
 export class RuntimeCore {
-  private readonly injection = new Map<string, string>(); // sessionId -> this turn's injection block
   private readonly turnCount = new Map<string, number>(); // sessionId -> user-turn counter (cadence)
   private readonly sessionState = new Map<string, { startTs: string; retainedTurns: number }>();
   /** Live write-back cursors. In memory, unlike the hook harnesses': this host outlives the session. */
@@ -50,8 +58,22 @@ export class RuntimeCore {
   private fetchTranscript?: (sessionId: string) => Promise<TransportTurn[]>;
   /** Write-backs started and not yet settled — what `flush` waits for. */
   private readonly inFlight = new Set<Promise<void>>();
-  private lastInjection = ""; // most recent turn's injection block, keyed by nothing (see getInjection)
+  /**
+   * This host's automatic injection, shared across its sessions because the state it keeps is per
+   * session and IS the delivery channel for a synthesis that outlived its step's wait.
+   *
+   * `reflectPatienceMs` is the whole difference between this host and a hook harness: this process
+   * outlives the step, so an answer that arrives after the wait can still be handed to a later step.
+   * A hook harness has nowhere to put it and passes `Infinity` (see core/hook.ts).
+   */
+  private readonly synthesis: AutoInject;
   private deferInitialReflect = false;
+  /**
+   * Which sessions have already taken their own copy of the cold-bank deferral. The core-level
+   * flag is per-BANK (seedIfCold has no session id) but the deferral itself is per-SESSION, so a
+   * multi-session host needs to know which sessions have had theirs; see `stepContext`.
+   */
+  private readonly deferredSessions = new Set<string>();
   /** Host-notice channel (opencode/Kilo: client.tui.showToast via the adapter). Optional, fail-open. */
   private notify?: (title: string, message: string) => void;
 
@@ -70,6 +92,10 @@ export class RuntimeCore {
     private readonly projectDir: string = process.cwd()
   ) {
     setLogLevel(cfg.logLevel);
+    // Read off this workspace's Config, so a repo with its own `banks.<id>` override gets its own
+    // patience — the same reason every other budget here is resolved from `cfg` and not from a
+    // process-wide default.
+    this.synthesis = new AutoInject({ patienceMs: cfg.reflectPatienceMs });
   }
 
   setNotifier(notify: (title: string, message: string) => void): void {
@@ -114,7 +140,7 @@ export class RuntimeCore {
    *
    * It deliberately does NOT keep that call's knowledge preamble. This runs once per PROCESS and
    * these hosts outlive every session, so a roster captured here is stale for every session but
-   * the first — `onPrompt` builds its own from the session's live page list (#4607).
+   * the first — `stepContext` builds its own from the session's live page list (#4607).
    */
   async seedIfCold(repoPath: string | undefined): Promise<void> {
     // Anti-recursion: a headless survey session runs the agent (which loads this plugin) with
@@ -161,28 +187,45 @@ export class RuntimeCore {
   }
 
   /**
-   * Each user turn delegates to the same `buildHookOutput` used by hook harnesses. The cache file
-   * intentionally replaces the old in-memory reflect/page state, keeping lifecycle behavior
-   * identical across hosts while this adapter retains only delivery-specific state.
+   * This STEP's injection, or undefined when it has nothing to inject.
+   *
+   * Call it on every step, `prompt` or not: a step with no prompt is a tool continuation, and it is
+   * the delivery channel for a synthesis that finished after the step that asked for it stopped
+   * waiting (see core/auto-inject.ts). A step WITH a prompt counts as a turn — it advances the
+   * cadence and is the only kind of step that can start a source.
+   *
+   * Delegates to the same `buildStepOutput` hook harnesses use, so the lifecycle behaviour is shared
+   * rather than reimplemented; the difference is the `AutoInject` this host passes it, whose patience
+   * is finite because this process survives the step.
    */
-  async onPrompt(sessionId: string | undefined, prompt: string): Promise<void> {
-    if (process.env.HINDSIGHT_DISABLE_HOOKS) return; // anti-recursion (see seedIfCold)
-    if (!sessionId || !prompt.trim()) return;
-    const turns = (this.turnCount.get(sessionId) ?? 0) + 1;
-    this.turnCount.set(sessionId, turns);
+  async stepContext(
+    sessionId: string | undefined,
+    prompt?: string
+  ): Promise<{ context?: string; notice?: string }> {
+    if (process.env.HINDSIGHT_DISABLE_HOOKS) return {}; // anti-recursion (see seedIfCold)
+    if (!sessionId) return {};
+    const turn = prompt !== undefined && prompt.trim() !== "";
+    const turns = turn ? (this.turnCount.get(sessionId) ?? 0) + 1 : (this.turnCount.get(sessionId) ?? 0);
+    if (turn) this.turnCount.set(sessionId, turns);
 
     const cacheFile = sessionCacheFile(this.harness, sessionId);
-    if (this.deferInitialReflect) {
-      // `seedIfCold` has no session id. Transfer its SessionStart decision to the first concrete
-      // session here; `buildHookOutput` consumes it exactly once, like hook harnesses do.
-      this.deferInitialReflect = false;
+    if (turn && this.deferInitialReflect && this.deferredSessions.add(sessionId)) {
+      // `seedIfCold` has no session id, so its cold-bank decision is transferred to each concrete
+      // session here — ONCE PER SESSION, exactly like the hook harnesses' SessionStart does. The
+      // core-level flag is deliberately NOT consumed: a persistent host runs several sessions over
+      // one cold bank (dsh's Web UI opens two agents on one repo), and the first session taking
+      // the flag left the second one synthesizing straight into a brand-new bank — the very
+      // thing the deferral exists to prevent. The flag falls when the NEXT cold-check says the
+      // bank is no longer new (`seedIfCold` overwrites it either way).
       writeSessionCache(cacheFile, { deferInitialReflect: true });
     }
-    const output = await buildHookOutput({
+    const output = await buildStepOutput({
       harness: this.harness,
-      prompt,
+      sessionId,
+      prompt: turn ? prompt : undefined,
       cfg: this.cfg,
       client: this.client,
+      synthesis: this.synthesis,
       cacheFile,
     });
 
@@ -192,7 +235,7 @@ export class RuntimeCore {
     // plugin load: that one is a process-lifetime snapshot, so a host started before the pages
     // existed told every later session "No knowledge pages yet" while the same turn's memory block
     // listed pages by id (#4607).
-    if (turns === 1) {
+    if (turn && turns === 1) {
       blocks.push(
         buildKnowledgePreamble(output.pages, {
           reflectOnNewGoals: this.cfg.autoInject !== "reflect",
@@ -210,20 +253,36 @@ export class RuntimeCore {
       this.notify?.("Hindsight · recalled past decisions", preview);
     }
     const block = blocks.filter(Boolean).join("\n\n");
-    this.injection.set(sessionId, block);
-    this.lastInjection = block; // for consumers that can't supply a sessionId (see getInjection)
+    return block ? { context: block, notice: output.notice } : { notice: output.notice };
   }
 
   /**
-   * The system-prompt text to inject this turn (built by the preceding onPrompt), or undefined.
-   * opencode's `experimental.chat.system.transform` hook fires with NO sessionId (input is just
-   * `{model}`), so a session-keyed lookup returns nothing there — fall back to the most recent
-   * turn's block (`lastInjection`). The completion's system.transform fires right after that
-   * session's `chat.message`/onPrompt, so `lastInjection` is this turn's block.
+   * The host disposed this session: drop what this process was keeping for it, so a long-lived
+   * server does not pin one entry per session it ever opened. A synthesis still in flight is NOT
+   * cancelled — it settles and records its answer in the session cache, where a later process finds
+   * it, which is strictly better than the answer disappearing with the bookkeeping.
+   *
+   * The cache's TURN COUNTER is reset with the in-memory one, on purpose: this host derives
+   * "turn 1" (the preamble boundary) from memory and the roster cadence from the cache file, and a
+   * resumed session reusing the same id would otherwise start at memory-turn-1 with a cache saying
+   * turn 5 — injecting the first-turn preamble AND a cadence refresh on the same step, and staying
+   * one apart from there. Cleared together, the two counters cannot disagree at any boundary.
    */
-  getInjection(sessionId: string | undefined): string | undefined {
-    const keyed = sessionId ? this.injection.get(sessionId) : undefined;
-    return keyed ?? this.lastInjection ?? undefined;
+  disposeSession(sessionId: string): void {
+    this.synthesis.dispose(sessionId);
+    this.turnCount.delete(sessionId);
+    this.sessionState.delete(sessionId);
+    this.deferredSessions.delete(sessionId);
+    try {
+      const cacheFile = sessionCacheFile(this.harness, sessionId);
+      const cached = readSessionCache(cacheFile);
+      if (cached.turns !== undefined || cached.pages !== undefined) {
+        const { turns: _t, pages: _p, ...rest } = cached;
+        writeSessionCache(cacheFile, rest);
+      }
+    } catch {
+      /* a cache file this cannot rewrite is the pre-existing behaviour: nothing further */
+    }
   }
 
   /**
@@ -280,15 +339,31 @@ export class RuntimeCore {
       });
       return;
     }
-    if (!turns.length) return;
-    this.recordUsage(sessionId, turns, true); // idle: the reply is in
+    this.retainIfGrown(sessionId, turns, "idle");
+  }
+
+  /**
+   * Retain an ALREADY-FETCHED transcript if it grew past the last write, recording its usage.
+   *
+   * Split out of `onSessionIdle` so a host that can read the transcript SYNCHRONOUSLY can take a
+   * last snapshot at a teardown boundary (dsh's `agent/disposed`, where the live agent is still
+   * attached but is about not to be) without racing the idle path's async fetch: whichever path
+   * gets there first wins the dedupe gate and the loser is a no-op, so the two cannot double-write
+   * either. The race this closes: `agent/turn-stopping` starts an async refetch, the host fires
+   * `agent/disposed` before it settles, disposal drops the live-agent entry, the fetch comes back
+   * empty — and the session's final exchange was never retained at all.
+   */
+  retainIfGrown(sessionId: string, turns: TransportTurn[], trigger = "idle"): void {
+    if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
+    if (!sessionId || !turns.length) return;
+    this.recordUsage(sessionId, turns, true); // the caller's snapshot includes the reply
     if (!this.writeBackEnabled) return; // usage above is local and recorded regardless (#5391)
     const st = this.stateFor(sessionId);
     // idle can fire more than once for one exchange (and again on a session with no new activity);
     // only retain when this transcript actually grew past what we last wrote.
     if (turns.length <= st.retainedTurns) return;
     st.retainedTurns = turns.length;
-    this.retain(sessionId, turns, st.startTs, "idle");
+    this.retain(sessionId, turns, st.startTs, trigger);
   }
 
   private recordUsage(sessionId: string, turns: TransportTurn[], lastTurnComplete: boolean): void {
@@ -319,21 +394,32 @@ export class RuntimeCore {
   }
 
   /**
-   * Wait for every write-back still in flight, at most `timeoutMs`. Write-backs stay fire-and-forget
-   * so a turn never blocks on the network; a host that announces its exit (pi's `session_shutdown`)
-   * calls this so the session's final retain is not dropped with the process (#5081). Bounded so a
-   * stalled server cannot hold the host's exit open. Never throws.
+   * Wait for every write-back still in flight, at most `timeoutMs` overall. Write-backs stay
+   * fire-and-forget so a turn never blocks on the network; a host that announces its exit (pi's
+   * `session_shutdown`) calls this so the session's final retain is not dropped with the process
+   * (#5081). Bounded so a stalled server cannot hold the host's exit open. Never throws.
+   *
+   * LOOPS rather than racing one snapshot: a retain spends up to `DAEMON_WAIT_RETAIN_MS` on
+   * `ensureDaemon` BEFORE its promise joins `inFlight`, so a single `Promise.all(this.inFlight)`
+   * taken at entry would miss a write-back that started moments earlier and is still in its
+   * daemon wait — exactly the unload window this exists to cover. Each pass waits for whatever
+   * is in the set NOW; when it drains, a set that has grown again gets another pass, until the
+   * budget is spent.
    */
   async flush(timeoutMs = FLUSH_TIMEOUT_MS): Promise<void> {
-    if (!this.inFlight.size) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      Promise.all(this.inFlight),
-      new Promise<void>((r) => {
-        timer = setTimeout(r, timeoutMs);
-      }),
-    ]);
-    clearTimeout(timer);
+    const deadline = Date.now() + timeoutMs;
+    while (this.inFlight.size) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.all([...this.inFlight]),
+        new Promise<void>((r) => {
+          timer = setTimeout(r, remaining);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
   }
 
   /**

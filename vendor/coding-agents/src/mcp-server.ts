@@ -17,6 +17,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { type Config } from "./core/config";
+import { DAEMON_WAIT_SESSION_START_MS, ensureDaemon } from "./core/daemon";
 import { resolveHostMemory } from "./core/host-client";
 import { HindsightClient } from "./core/hindsight";
 import { buildKnowledgeTools, type ToolSpec } from "./core/knowledge-tools";
@@ -132,6 +133,13 @@ async function main() {
   // `{harness}` bank template, so both routes into a repo land in ONE bank.
   const harness = resolveHarness();
   const { cfg, bankId, client } = resolveHostMemory(harness, cwd);
+
+  // Daemon mode: every other entry point reaches one of the two ensure points (SessionStart or the
+  // write path) — this one built a client and went straight to serving, so a daemon-mode cold
+  // start whose survey agent reached the MCP server before any session ran seedIfCold answered
+  // every hindsight_* call with ECONNREFUSED. Same brief wait as seedIfCold: start it, wait only
+  // a moment, let a cold one keep coming up behind the connect.
+  if (!cfg.disabled) await ensureDaemon(cfg, harness, { waitMs: DAEMON_WAIT_SESSION_START_MS });
 
   const server = buildMcpServer(selectTools(cfg, client, bankId, { cwd, harness }));
 

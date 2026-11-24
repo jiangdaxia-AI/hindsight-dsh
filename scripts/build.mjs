@@ -2,8 +2,8 @@
  * Build both halves of the plugin.
  *
  * HOST (`dist/*.js`) — self-contained ESM, no runtime dependencies. The host half inlines the shared
- * memory runtime from `vendor/coding-agents` (a pinned copy of
- * `hindsight-integrations/coding-agents`, kept in step by `scripts/sync-runtime.mjs`), its
+ * memory runtime from `vendor/coding-agents` (this package's own source, forked from
+ * `hindsight-integrations/coding-agents` and pinned by `scripts/pin-runtime.mjs`), its
  * dependencies (`zod`, `@vectorize-io/hindsight-all`, `jsonc-parser`, `smol-toml`) and Schemastery,
  * so no resolution step can fail inside a profile and no version can drift.
  *
@@ -34,7 +34,7 @@ function readPackageJson() {
   return JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
 }
 
-/** The shared runtime this package bundles rather than reimplements — see scripts/sync-runtime.mjs. */
+/** The runtime this package owns and bundles — pinned by scripts/pin-runtime.mjs. */
 const RUNTIME = resolve(root, "vendor", "coding-agents", "src");
 
 /** The package name, which is also the browser module id the kernel registers. */
@@ -153,11 +153,10 @@ function directlyImportedPackages(metafile) {
 /**
  * Fail if a package the bundle needs is not declared in `package.json`.
  *
- * This is the check that makes the vendored runtime safe to re-sync. The runtime's dependencies are
- * declared upstream, in `hindsight-integrations/coding-agents/package.json` — a file this package
- * never sees at build time. So when upstream reaches for a new package, this copy keeps building
- * right up until it doesn't, and the failure reads like a bug in this package. Declaring them here
- * and asserting it makes a re-sync tell you exactly what to add.
+ * This is the check that makes the runtime safe to change. Its dependencies are declared in
+ * `vendor/coding-agents/package.json`, which is not the manifest the bundle is built against — so a
+ * new import there keeps building right up until it doesn't, and the failure reads like a bug in
+ * this package. Declaring them here and asserting it makes the change tell you exactly what to add.
  */
 const declared = new Set(Object.keys(readPackageJson().devDependencies ?? {}));
 const undeclared = [...directlyImportedPackages(hostBuild.metafile)]

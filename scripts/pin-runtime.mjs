@@ -1,50 +1,42 @@
 #!/usr/bin/env node
 /**
- * Re-vendor the shared Hindsight runtime from a `hindsight` checkout.
+ * Guard — and, optionally, re-pin — the runtime this package owns.
  *
- * WHY THIS EXISTS. The plugin's host half is a thin shell: the memory runtime it drives (recall,
- * retain, banks, seeding, the knowledge tools, the compaction ledger) lives in
- * `hindsight-integrations/coding-agents`, where twenty other harnesses share it. This package does
- * not reimplement it and does not resolve it at install time; it CARRIES a pinned copy under
- * `vendor/`, and `scripts/build.mjs` inlines that copy into `dist/host.js`. So an install is a link
- * and a copy, nothing resolves inside a profile, and no version can drift under a user.
+ * WHAT THE RUNTIME IS NOW. The memory runtime (recall, retain, banks, seeding, the knowledge tools,
+ * the compaction ledger) was forked out of `hindsight-integrations/coding-agents`, where twenty
+ * other harnesses shared it, so that this package could be cloned, installed and built on its own.
+ * As of the session-injection work it is **this project's own source**: `vendor/coding-agents/` is
+ * first-party code, `scripts/build.mjs` inlines it into `dist/host.js`, and a change to it is an
+ * ordinary change to this repository. `vendor/VENDOR.json` records where the fork came from
+ * (`origin`) and what the tree looks like (`inventory`) — provenance and a pin, not a promise that
+ * the two still agree. They deliberately do NOT, and `--from` will say so.
  *
- * The cost of carrying a copy is that it can fall behind. That is this script's whole job:
+ * THREE MODES:
  *
- *   node scripts/sync-runtime.mjs --from ../hindsight-main     # take a new copy
- *   node scripts/sync-runtime.mjs --check                      # fail if the copy was hand-edited
+ *   node scripts/pin-runtime.mjs --record    # I changed the runtime: re-pin it as it stands
+ *   node scripts/pin-runtime.mjs --check     # fail if the tree drifted from the recorded pin
+ *   node scripts/pin-runtime.mjs --from ../hindsight-main   # report divergence from a checkout
  *
- * `--check` never needs a checkout: it verifies the pinned inventory and the boundary below. Given
- * `--from` it additionally compares the copy against that upstream revision IN BOTH DIRECTIONS —
- * every file we carry must match, and every file upstream has must be carried — which is how a
- * maintainer confirms a sync actually took, or discovers that one is due.
+ * WHY THE PIN IS STILL WORTH KEEPING. Ownership does not make the boundary safe. The failure mode is
+ * silent in both directions: a half-finished or stray edit changes what the bundle does while
+ * looking like any other diff, and one import out of `core/` into a harness file means the tree no
+ * longer bundles at all. So `--check` proves, on every CI run, that the tree is byte-for-byte what
+ * the pin records and that the imported set is still closed. `--record` is the honest way to move
+ * the pin — it re-hashes and re-checks the boundary FIRST, so it cannot pin a tree that is broken —
+ * and it exists so that "the guard is in the way" never becomes a reason to hand-edit the manifest.
  *
- * WHAT IS COPIED — and why the boundary is stable. The set below is closed: no vendored file
- * imports anything outside it. The script proves that BEFORE it writes a single byte, against the
- * upstream text, and refuses a tree that would violate it. Checking first is the whole point: the
- * failure mode is otherwise silent — upstream adds one import from `core/` into a harness file, the
- * vendored copy no longer bundles, and the breakage surfaces only later, looking like this
- * package's own bug.
+ * `--from` is a DIAGNOSTIC, not a sync path: it compares the tree against a hindsight checkout in
+ * both directions ("every file we carry still matches", "every file upstream has that we never
+ * took") and reports differences as problems. After a deliberate local change it is EXPECTED to
+ * fail; that is the information, not a defect. Copying from a checkout is the one thing this script
+ * no longer does, because the tree is no longer a copy.
  *
- * `vendor/coding-agents/package.json` is generated, not copied: `core/hindsight.ts` imports its
- * `version` for the `USER_AGENT` it sends the server, so the vendored tree needs a real file there
- * carrying the upstream version. It is inside the hashed set, because a hand-edit there changes
- * what this package claims to be just as surely as an edit to a source file.
- *
- * The vendored copy is the single source of truth for what this package builds against; upstream
- * stays the single source of truth for the code. Re-sync deliberately, and name the upstream
- * revision in the commit.
+ * `vendor/coding-agents/package.json` is inside the hashed set on purpose: `core/hindsight.ts`
+ * imports its `version` for the `USER_AGENT` it sends the server, so an edit there changes what this
+ * package claims to be just as surely as an edit to a source file.
  */
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -55,17 +47,34 @@ const VENDOR_SRC = join(VENDOR_PKG_DIR, "src");
 const VENDOR_PKG_JSON = join(VENDOR_PKG_DIR, "package.json");
 const LOCK_FILE = join(VENDOR_DIR, "VENDOR.json");
 
+/**
+ * Where the runtime was forked from, recorded when the lock file does not exist yet. Metadata: it
+ * says which upstream revision this tree STARTED as, not that it still equals it — see the header.
+ */
+const FORK_ORIGIN = {
+  package: "@vectorize-io/hindsight-coding-agents",
+  version: "0.8.1",
+  commit: "ff9d09dd54ab8977e0901aeeae18f7db164511b0",
+  note:
+    "Forked from hindsight-integrations/coding-agents and now first-party source of this package; " +
+    "the tree MAY differ from this revision by design (see scripts/pin-runtime.mjs).",
+};
+
+
 /** Upstream package the runtime lives in, relative to a hindsight checkout root. */
 const UPSTREAM_SUBDIR = join("hindsight-integrations", "coding-agents");
 
 /**
- * Whole directories copied minus `*.test.ts`.
+ * What this package's runtime tree holds beyond `core/`.
  *
- * `core/` is the runtime; its tests stay upstream, where they run against the real package. A few
- * files in here are not reachable from this plugin's entries (the other harnesses' transcript
- * readers); they are copied anyway so the vendored tree stays a coherent `core/` rather than a
- * hand-picked subset the next sync would have to re-derive. esbuild tree-shakes what is unused out
- * of the bundle, so they cost nothing in `dist/`.
+ * `core/` comes as a whole directory (minus `*.test.ts`, which run against the runtime here and are
+ * NOT part of the shipped tree): a few files in it are unreachable from this package's entries (the
+ * other harnesses' transcript readers), and they are kept anyway so `core/` stays a coherent
+ * directory rather than a hand-picked subset. esbuild tree-shakes what is unused out of the bundle,
+ * so they cost nothing in `dist/`.
+ *
+ * The two lists together are also what `--from` compares a hindsight checkout against, which is the
+ * only thing they are read for now that the tree is not copied from anywhere.
  */
 const COPY_DIRS = ["core"];
 
@@ -75,8 +84,8 @@ const COPY_DIRS = ["core"];
  * The four non-`dsh` entries are imported by nothing: the runtime reaches for them BY PATH, as
  * siblings of whatever module is running (`dirname(import.meta.url)`), and spawns them. They must
  * exist beside `dist/host.js` or a feature silently never happens, so they are bundle entrypoints
- * (see `scripts/build.mjs`) and therefore vendored. `harness/registry.ts` is what `core/` imports to
- * enumerate harnesses, so it is the one file pulled in from outside `core/`.
+ * (see `scripts/build.mjs`). `harness/registry.ts` is what `core/` imports to enumerate harnesses, so
+ * it is the one file pulled in from outside `core/`.
  */
 const COPY_FILES = [
   "dsh.ts",
@@ -101,7 +110,7 @@ function toPosix(path) {
 }
 
 function fail(message) {
-  console.error(`sync-runtime: ${message}`);
+  console.error(`pin-runtime: ${message}`);
   process.exit(1);
 }
 
@@ -162,16 +171,8 @@ function upstreamPkgPath(upstream) {
   return join(upstream, UPSTREAM_SUBDIR, "package.json");
 }
 
-/** The upstream revision this copy came from, when the checkout is a git repo. */
-function upstreamCommit(upstream) {
-  try {
-    return execFileSync("git", ["-C", upstream, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  } catch {
-    return undefined;
-  }
-}
-
-/** Every path a fresh sync would copy, relative to `vendor/coding-agents/src`. */
+/** Every path a hindsight checkout's runtime holds, relative to its `src/` — what `--from`
+ *  compares the owned tree against, in both directions. */
 function upstreamFileSet(upstream) {
   const wanted = new Set();
   for (const rel of COPY_FILES) {
@@ -273,7 +274,7 @@ function findEscapingImports(files, readSource) {
         if (!existsSync(VENDOR_PKG_JSON)) {
           problems.push(
             `src/${rel} imports "${spec}", which is generated (vendor/coding-agents/package.json) ` +
-              `but is MISSING — re-run the sync with --from <hindsight checkout>`,
+              `but is MISSING — restore it from git; it is not copied from anywhere`,
           );
         }
         continue;
@@ -283,10 +284,9 @@ function findEscapingImports(files, readSource) {
       const real = existsSync(target);
       problems.push(
         real
-          ? `src/${rel} imports "${spec}", which is real but OUTSIDE the vendored set`
-          : `src/${rel} imports "${spec}", which is not vendored — either upstream moved it ` +
-              `(re-run the sync with --from <hindsight checkout>) or it is deliberately not ` +
-              `vendored, in which case add it to COPY_DIRS/COPY_FILES so the boundary stays closed`,
+          ? `src/${rel} imports "${spec}", which is real but OUTSIDE the bundled set`
+          : `src/${rel} imports "${spec}", which is not in the bundled set — add it to ` +
+              `COPY_DIRS/COPY_FILES so the boundary stays closed, or the bundle will not build`,
       );
     }
   }
@@ -297,88 +297,65 @@ function findEscapingImports(files, readSource) {
 
 const args = process.argv.slice(2);
 const check = args.includes("--check");
+const record = args.includes("--record");
 const fromIndex = args.indexOf("--from");
 const fromArg = fromIndex !== -1 ? args[fromIndex + 1] : undefined;
 if (fromIndex !== -1 && !fromArg) fail("--from needs a path to a hindsight checkout");
+if (check && record) fail("--check and --record are opposites — pass one");
+if (record && fromArg) fail("--record re-pins the tree as it stands and takes no --from");
 
 function report(problems) {
   for (const problem of problems) console.error(`  ${problem}`);
 }
 
-if (!check) {
-  const upstream = resolveUpstream(fromArg);
-  const wanted = upstreamFileSet(upstream);
-  if (wanted.size === 0) fail("the file set is empty — refusing to write an empty vendor tree");
-
-  // Boundary FIRST, against upstream text. A tree that would be broken is never written, so a
-  // refused sync leaves the working tree exactly as it found it.
-  const readUpstream = (rel) => {
-    const path = join(upstreamSrc(upstream), ...rel.split("/"));
+/** The boundary problems in the tree AS IT STANDS — what `--record` must clear before it pins. */
+function boundaryProblems() {
+  return findEscapingImports(new Set(walkVendorSrc()), (rel) => {
+    const path = join(VENDOR_SRC, ...rel.split("/"));
     return existsSync(path) ? readFileSync(path, "utf8") : undefined;
-  };
-  const escaping = findEscapingImports(wanted, readUpstream);
+  });
+}
+
+if (record) {
+  const { hash, count } = hashInventory();
+  if (count === 0) fail("the runtime tree is empty — refusing to record nothing");
+
+  // Boundary FIRST, exactly like a write used to be: pinning a tree that cannot bundle would make
+  // the guard promise something false, and leave the breakage to surface as a bundling error later.
+  const escaping = boundaryProblems();
   if (escaping.length > 0) {
     report(escaping);
-    fail(`${escaping.length} problem(s) at the vendoring boundary — nothing was written`);
+    fail(`${escaping.length} problem(s) at the runtime boundary — nothing was recorded`);
   }
 
-  mkdirSync(VENDOR_SRC, { recursive: true });
-
-  // Prune first: a file upstream deleted or renamed must not linger here and still be bundled.
-  for (const rel of walkVendorSrc()) {
-    if (!wanted.has(rel)) rmSync(join(VENDOR_SRC, ...rel.split("/")));
-  }
-
-  for (const rel of wanted) {
-    const dest = join(VENDOR_SRC, ...rel.split("/"));
-    mkdirSync(dirname(dest), { recursive: true });
-    writeFileSync(dest, readUpstream(rel));
-  }
-
-  // `core/hindsight.ts` imports this for the User-Agent it sends, so it must carry the real
-  // upstream version — not a stub, and not this package's own version.
-  const pkg = JSON.parse(readFileSync(upstreamPkgPath(upstream), "utf8"));
-  writeFileSync(
-    VENDOR_PKG_JSON,
-    `${JSON.stringify({ name: pkg.name, version: pkg.version }, null, 2)}\n`,
-  );
-
-  const { hash, count } = hashInventory();
   const previous = existsSync(LOCK_FILE) ? JSON.parse(readFileSync(LOCK_FILE, "utf8")) : undefined;
-  const upstreamRecord = {
-    // Generated by scripts/sync-runtime.mjs — do not edit. `upstream` says where the copy came
-    // from; `inventory` is what `--check` verifies in CI, where no checkout exists.
-    package: pkg.name,
-    version: pkg.version,
-    commit: upstreamCommit(upstream) ?? null,
-  };
-
-  // Re-syncing the same upstream must leave the tree byte-identical, or every no-op sync would
-  // show up as a spurious diff. `syncedAt` describes the content, so it is carried over when the
-  // content did not change.
+  // Re-recording an unchanged tree must be a no-op, or every record would show up as a diff and the
+  // timestamp would stop meaning "when this content became the pin".
   const unchanged =
-    previous !== undefined &&
-    previous.inventory === hash &&
-    previous.fileCount === count &&
-    JSON.stringify(previous.upstream) === JSON.stringify(upstreamRecord);
+    previous !== undefined && previous.inventory === hash && previous.fileCount === count;
 
   writeFileSync(
     LOCK_FILE,
     `${JSON.stringify(
       {
-        upstream: upstreamRecord,
+        origin: previous?.origin ?? FORK_ORIGIN,
         fileCount: count,
         inventory: hash,
-        syncedAt: unchanged ? previous.syncedAt : new Date().toISOString(),
+        recordedAt: unchanged ? previous.recordedAt : new Date().toISOString(),
       },
       null,
       2,
     )}\n`,
   );
   console.log(
-    `synced ${count} files from ${UPSTREAM_SUBDIR}@${pkg.version}` +
-      `${upstreamRecord.commit ? ` (${upstreamRecord.commit.slice(0, 12)})` : ""}` +
-      `${unchanged ? " — unchanged" : ""}`,
+    `recorded ${count} files — the runtime pins as it stands` +
+      `${unchanged ? " (unchanged)" : ""}`,
+  );
+} else if (!check) {
+  fail(
+    "this script no longer copies a runtime from a hindsight checkout — the tree under " +
+      "vendor/coding-agents is this package's own source. Pass --record to re-pin a deliberate " +
+      "change, --check to verify the pin, or --check --from <checkout> to compare against upstream.",
   );
 } else {
   // In check mode the vendored tree is the subject, so it is also the set under test — this keeps
@@ -388,12 +365,13 @@ if (!check) {
   const lock = existsSync(LOCK_FILE) ? JSON.parse(readFileSync(LOCK_FILE, "utf8")) : undefined;
   const problems = [];
 
-  if (!lock) problems.push("vendor/VENDOR.json is missing — run the sync");
+  if (!lock) problems.push("vendor/VENDOR.json is missing — run --record to pin the tree");
   else if (lock.inventory !== inventory.hash) {
     problems.push(
-      `the vendored runtime does not match vendor/VENDOR.json ` +
-        `(${inventory.count} files now, ${lock.fileCount} recorded) — a file was hand-edited, ` +
-        `added or removed. Re-run the sync with --from <hindsight checkout>.`,
+      `the runtime does not match vendor/VENDOR.json ` +
+        `(${inventory.count} files now, ${lock.fileCount} recorded) — a file was edited, added or ` +
+        `removed since it was pinned. If the change was DELIBERATE, re-pin it with ` +
+        `\`node scripts/pin-runtime.mjs --record\`; if it was not, you have a stray edit.`,
     );
   }
   problems.push(
@@ -406,30 +384,38 @@ if (!check) {
   if (fromArg) {
     const upstream = resolveUpstream(fromArg);
 
+    // A DIAGNOSTIC, and its findings are expected to be non-empty: this tree is owned source and
+    // MAY differ from the revision it was forked from. What it is for is telling the two apart —
+    // "we changed this on purpose" from "we are behind a fix upstream has".
+    //
     // Every file we carry must still be there upstream, and match it byte for byte.
+    // Only files BOTH trees have can differ. A file this tree carries and the checkout does not is
+    // either ours (`core/auto-inject.ts` was written here) or a file upstream dropped, and the
+    // filesystem cannot tell those apart — reporting it as "no longer exists upstream, re-check
+    // COPY_FILES" was advice about a copy list that no longer copies. `*.test.ts` are excluded
+    // because the bundled set excludes them by contract, which also keeps a local test from
+    // colliding with an upstream one of the same name.
+    const expected = upstreamFileSet(upstream);
     for (const rel of [...files].sort()) {
+      if (rel.endsWith(".test.ts") || !expected.has(rel)) continue;
       const a = join(upstreamSrc(upstream), ...rel.split("/"));
-      if (!existsSync(a)) {
-        problems.push(`src/${rel} no longer exists upstream — re-check COPY_FILES/COPY_DIRS`);
-        continue;
-      }
       const b = join(VENDOR_SRC, ...rel.split("/"));
       if (!existsSync(b) || readFileSync(a, "utf8") !== readFileSync(b, "utf8")) {
         problems.push(`src/${rel} differs from upstream`);
       }
     }
 
-    // The comparison has to run the other way too. Every file above is named by the VENDORED tree,
-    // so a copy that is merely BEHIND — upstream added a file this package never took — reported
-    // OK, which is exactly the case `--from` exists to catch.
-    for (const rel of [...upstreamFileSet(upstream)].sort()) {
+    // The comparison has to run the other way too. Without it, a tree that is merely BEHIND —
+    // upstream added a file this package never took — reported OK, which is exactly the case
+    // `--from` exists to catch.
+    for (const rel of [...expected].sort()) {
       if (!files.has(rel)) {
-        problems.push(`src/${rel} exists upstream but is NOT vendored — run the sync`);
+        problems.push(`src/${rel} exists upstream but is NOT vendored — never taken, or dropped`);
       }
     }
 
     if (!existsSync(VENDOR_PKG_JSON)) {
-      problems.push("vendor/coding-agents/package.json is missing — run the sync");
+      problems.push("vendor/coding-agents/package.json is missing — run --record");
     } else if (
       JSON.parse(readFileSync(VENDOR_PKG_JSON, "utf8")).version !==
       JSON.parse(readFileSync(upstreamPkgPath(upstream), "utf8")).version

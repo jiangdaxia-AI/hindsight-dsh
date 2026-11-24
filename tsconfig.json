@@ -18,5 +18,5 @@
       "@deepseek-ai/dsh-client-ui-primitives": ["./src/client/primitives.d.ts"]
     }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "scripts/**/*.mjs"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vendor/coding-agents/src/**/*.ts", "scripts/**/*.mjs"]
 }

@@ -10,7 +10,13 @@
  * `process.execPath` is the executable already running this code, so it needs no lookup. When that
  * executable is Electron, the child must be told to behave as Node (`ELECTRON_RUN_AS_NODE`),
  * otherwise it would open another copy of the application instead of running the script.
+ *
+ * This is also the one place a Hindsight child's environment gets the credential the host resolved
+ * for it: `spawnCredentialEnv` reads a 0600 file (never `process.env`, which every descendant of
+ * the host would inherit) and adds it to THIS child alone — see core/spawn-credentials.ts.
  */
+import { spawnCredentialEnv } from "./spawn-credentials";
+
 /** What to spawn a sibling script with, and the environment that makes it behave as Node. */
 export interface NodeLaunch {
   /** The executable: the one running this process. */
@@ -30,8 +36,9 @@ export function nodeLaunch(env: NodeJS.ProcessEnv = process.env): NodeLaunch {
   // Electron sets `process.versions.electron`; under plain Node the flag is unnecessary, and
   // harmless when inherited from a parent that had it.
   const electron = Boolean(process.versions.electron) || env.ELECTRON_RUN_AS_NODE === "1";
+  const withCredential = { ...spawnCredentialEnv(), ...env } as NodeJS.ProcessEnv;
   return {
     command,
-    env: electron ? { ...env, ELECTRON_RUN_AS_NODE: "1" } : env,
+    env: electron ? { ...withCredential, ELECTRON_RUN_AS_NODE: "1" } : withCredential,
   };
 }

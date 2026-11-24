@@ -149,8 +149,7 @@ function scanForSpawnTargets(dir) {
       if (!builtEntries.has(target)) {
         complain(
           `${full.slice(ROOT.length + 1)} spawns "${target}" by path, but nothing builds it — ` +
-            `add it to the entryPoints in scripts/build.mjs and to COPY_FILES in ` +
-            `scripts/sync-runtime.mjs, or that feature will silently never run`,
+            `add it to the entryPoints in scripts/build.mjs, or that feature will silently never run`,
         );
       }
     }

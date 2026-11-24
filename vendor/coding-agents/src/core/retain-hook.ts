@@ -10,7 +10,7 @@
  * which is what separates it from the `disabled` kill switch.
  *
  * The pure logic lives in `buildRetain` (path + client in, void out) so it's unit-testable
- * without stdin; `runRetainHook` is thin plumbing around it, mirroring `runHook`/`buildHookOutput`
+ * without stdin; `runRetainHook` is thin plumbing around it, mirroring `runHook`/`buildStepOutput`
  * in core/hook.ts.
  */
 import { deriveBankIdOrSkip } from "./bank";

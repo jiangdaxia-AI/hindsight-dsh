@@ -13,8 +13,8 @@ export interface SessionCache {
   reflectAnswer?: string; // present (even "") = reflect already resolved this session
   /** How many times auto-inject has been ATTEMPTED this session — every source, not just reflect.
    *  A failure leaves `reflectAnswer` unset so a later turn can retry; this bounds that retry (see
-   *  HOOK_INJECT_ATTEMPTS). Named for reflect like `reflectAnswer` above, whose name also predates
-   *  the other two sources. */
+   *  `SYNTHESIS_FAILED_ATTEMPTS`/`RETRIEVAL_EMPTY_ATTEMPTS` in core/auto-inject.ts). Named for
+   *  reflect like `reflectAnswer` above, whose name also predates the other two sources. */
   reflectAttempts?: number;
   /** SessionStart saw a new/empty bank; consume this on prompt one, then allow reflect. */
   deferInitialReflect?: boolean;
@@ -67,7 +67,7 @@ export function writeSessionCache(cacheFile: string, cache: SessionCache): void 
 }
 
 /** Context a prompt hook could not deliver itself, waiting for the session's next tool hook (see
- *  HookSpec.toolHook). Its own file: `buildHookOutput` rewrites the session cache every turn. */
+ *  HookSpec.toolHook). Its own file: `buildStepOutput` rewrites the session cache every turn. */
 function pendingContextFile(harness: string, sessionId: string): string {
   return join(tmpdir(), `hindsight-${harness}`, `${sessionId}.pending`);
 }

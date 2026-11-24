@@ -8,7 +8,7 @@
  * and the awaited stop boundary.
  *
  *   agent/session-start  -> RuntimeCore.seedIfCold      (cold-check + background git/codebase seed)
- *   agent/pre-step       -> RuntimeCore.onPrompt        (recall) + the injection as a sourced message
+ *   agent/pre-step       -> RuntimeCore.stepContext  (recall) + the injection as a sourced message
  *   agent/turn-stopping  -> RuntimeCore.onSessionIdle   (write-back of the completed exchange)
  *   ctx.tools            -> the hindsight_* knowledge suite, registered natively
  *
@@ -211,6 +211,13 @@ const workspaces = new Map<string, Workspace | null>();
  * pinning every session it ever opened.
  */
 const liveAgents = new Map<string, DshAgent>();
+/**
+ * Which sessions have had their one `seedFromLog` pass. Guards against the double bind below
+ * (`agent/session-start` AND `agent/created` both firing on hosts that carry both events): the
+ * by-key span dedupe keeps a second pass HARMLESS, but it is a full scan of a resumed session's
+ * log for nothing. Dropped on disposal like every other per-session map.
+ */
+const sessionStarted = new Set<string>();
 /**
  * sessionId -> the watcher that owns its compaction ledger.
  *
@@ -499,7 +506,14 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
         // `session/event`, so everything before this process — including compactions that already
         // ran — would otherwise be invisible and unrecoverable. Seeding costs one pass over a log
         // this process already holds, and retains nothing (see `seedFromLog`).
-        if (source !== "startup") {
+        //
+        // `sessionStarted` guards the DOUBLE BIND below: on a host that still fires 0.1's
+        // `agent/session-start` AND 0.2's `agent/created`, the second firing used to run
+        // seedFromLog again — by-key span dedupe kept it harmless, but a full log pass per
+        // session per event is a real cost on long resumed sessions, and the legacy payload
+        // carries no `source`, so a startup session was scanned too. The seed runs ONCE, and
+        // the guard resets on `agent/disposed` like every other per-session map.
+        if (source !== "startup" && sessionStarted.add(sessionId)) {
           workspace.watcher.seedFromLog(sessionId, dshSessionEvents(agent.session));
         }
       }
@@ -523,21 +537,27 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
 
       const messages = [...decision.messages];
 
-      // Recall answers "what does memory know about this prompt", so it stays gated on there BEING
-      // a prompt: on a tool continuation the block is already in the history being sent.
+      // Memory answers "what does the bank know about this STEP". It runs on every step, not only on
+      // the ones carrying a prompt: the whole point of a bounded wait is that a synthesis which
+      // missed it is delivered later, and a later step is where that happens — this same turn's tool
+      // continuation, if it landed in between, or the next turn. A prompt-only gate left the late
+      // answer with nowhere to go, because on a continuation the block is NOT already in the history
+      // being sent (see core/auto-inject.ts).
       const prompt = promptOf(decision.messages);
-      if (prompt) {
-        await workspace.core.onPrompt(sessionId, prompt);
-        const injection = workspace.core.getInjection(sessionId);
-        if (!injection) {
-          diag(HARNESS, "inject_empty", { session: sessionId });
-        } else if (injection === lastInjected.get(sessionId)) {
+      const injection = await workspace.core.stepContext(sessionId, prompt || undefined);
+      if (injection.context) {
+        const block = injection.context;
+        if (block === lastInjected.get(sessionId)) {
           diag(HARNESS, "inject_unchanged", { session: sessionId });
         } else {
-          lastInjected.set(sessionId, injection);
-          diag(HARNESS, "inject_ok", { session: sessionId, chars: injection.length });
-          messages.push(injectionMessage(injection));
+          lastInjected.set(sessionId, block);
+          diag(HARNESS, "inject_ok", { session: sessionId, chars: block.length });
+          messages.push(injectionMessage(block));
         }
+      } else if (prompt) {
+        // Only a step that carried a prompt is a TURN with no memory; saying it on every tool
+        // continuation would turn one memory-less session into a page of noise.
+        diag(HARNESS, "inject_empty", { session: sessionId });
       }
 
       // Compaction recovery is deliberately NOT gated on a prompt. The steps that most need a
@@ -545,8 +565,10 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
       // the prompt-only guard this replaces meant memory was never consulted at all.
       //
       // Everything it reads is already in memory: the ledger the watcher filled, and the paths of
-      // the session's recent tool calls. Nothing here may go to the network, because `agent/pre-step`
-      // is an awaited waterfall and every millisecond is on the user's critical path.
+      // the session's recent tool calls. Nothing in THIS block may go to the network, because
+      // `agent/pre-step` is an awaited waterfall and every millisecond is on the user's critical
+      // path — the memory call above is the one thing on this path that talks to a server, and it is
+      // held to its own budgets for exactly that reason (see core/auto-inject.ts).
       // The relevance signal costs a backward scan of the session log, and only `auto` reads it —
       // the default `handle` mode names spans without judging relevance — so a step that cannot use
       // it does not compute it.
@@ -620,22 +642,37 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
 
     disposed({ agent }: { agent: DshAgent }): void {
       const sessionId = agent.session.header.id;
-      // Drain this workspace's in-flight write-backs. `agent/disposed` fires "after driver
-      // quiescence and scoped-registration unwind, but before session detachment", so the live log
-      // our transcript source reads is still attached here — this boundary is the last one where a
-      // drain can still see the session.
-      //
       // Lookup-only, deliberately never `workspaceFor`: that would CONSTRUCT a RuntimeCore while an
       // agent is being torn down, just to flush it.
       const workspace = workspaces.get(workspaceRoot(agent));
       if (workspace) {
+        // The LAST write-back, taken synchronously while the live log is still attached: a host
+        // can fire `agent/disposed` while `agent/turn-stopping`'s async refetch is still in
+        // flight, and that fetch comes back empty the moment disposal drops the live-agent entry
+        // — the session's final exchange was lost to exactly that race. Snapshotting here and
+        // handing it to `retainIfGrown` closes it: the dedupe gate makes whichever path lands
+        // first the winner and the other a no-op, so there is no double-write either.
+        try {
+          workspace.core.retainIfGrown(sessionId, readDshEvents(dshSessionEvents(agent.session)), "dispose");
+        } catch {
+          /* a snapshot that cannot be read is the pre-existing behaviour: flush only */
+        }
+        // Drain this workspace's in-flight write-backs. `agent/disposed` fires "after driver
+        // quiescence and scoped-registration unwind, but before session detachment", so the live log
+        // our transcript source reads is still attached here — this boundary is the last one where a
+        // drain can still see the session.
         void workspace.core.flush();
+        // Drop this session's local state with it: the turn counter, the write-back cursor, and the
+        // injector's per-session entry — including a synthesis still in flight, which settles into
+        // the session cache rather than into a map for a session nobody will ask about again.
+        workspace.core.disposeSession(sessionId);
         // Drop the ledger with the session. A resumed session rebuilds it from its own log, so
         // nothing is lost by forgetting it here, and a long-lived server does not pin the event
         // buffer of every session it ever opened.
         workspace.watcher?.forget(sessionId);
       }
       sessionWatchers.delete(sessionId);
+      sessionStarted.delete(sessionId);
       codeFactTurns.delete(sessionId);
       liveAgents.delete(sessionId);
       lastInjected.delete(sessionId);

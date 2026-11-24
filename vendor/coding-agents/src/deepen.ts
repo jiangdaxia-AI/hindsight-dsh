@@ -57,9 +57,19 @@ const BANK =
   arg("bank") ??
   (REPO ? deriveBankIdOrSkip(cfg0, REPO, arg("harness") ?? cfg0.harness) : cfg0.bankId) ??
   undefined;
-const resolved0 = BANK
-  ? applyBankConfig(cfg0, BANK, REPO ?? undefined)
-  : { cfg: cfg0, bankId: BANK };
+// Usage first, resolution second: an explicit `--bank` with no `--repo` used to run
+// applyBankConfig (with directory=undefined, which SKIPS the optInOnly check) and only then
+// report the missing repo — one pass of bank resolution on arguments the run was about to
+// refuse anyway. REPO is now guaranteed below, so the opt-in check always runs too.
+if (!REPO || !BANK) {
+  console.error(
+    "usage: node deepen.js --repo <path> [--bank <id>] [--harness <name>] " +
+      "[--conversations f.json] [--api-url U] [--api-token X] [--config path] [--gitlog-limit N] [--git-ingest message|full|none]\n" +
+      `harnesses: ${HARNESS_NAMES.join(", ")}`
+  );
+  process.exit(1);
+}
+const resolved0 = applyBankConfig(cfg0, BANK, REPO);
 const cfg = resolved0.cfg;
 const FINAL_BANK = resolved0.bankId ?? BANK;
 if (cfg.disabled) {
@@ -78,15 +88,6 @@ const GITLOG_LIMIT = arg("gitlog-limit") ? Number(arg("gitlog-limit")) : (cfg.se
 // harness override (benchmark/e2e want deterministic depth regardless of user config)
 const GIT_INGEST =
   (["message", "full", "none"] as const).find((m) => m === arg("git-ingest")) ?? cfg.gitIngest;
-
-if (!REPO || !BANK) {
-  console.error(
-    "usage: node deepen.js --repo <path> [--bank <id>] [--harness <name>] " +
-      "[--conversations f.json] [--api-url U] [--api-token X] [--config path] [--gitlog-limit N] [--git-ingest message|full|none]\n" +
-      `harnesses: ${HARNESS_NAMES.join(", ")}`
-  );
-  process.exit(1);
-}
 
 setLogLevel(cfg.logLevel);
 // Foreground runs (benchmark/e2e) read stdout; background runs are followed via the leveled
