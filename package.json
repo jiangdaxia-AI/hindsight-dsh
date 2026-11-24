@@ -1,6 +1,6 @@
 {
   "name": "hindsight-dsh",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Hindsight long-term memory for DeepSeek Harness — a self-contained Cordis plugin with an in-app settings page (cloud, self-hosted, or a local daemon).",
   "keywords": [
     "dsh",
