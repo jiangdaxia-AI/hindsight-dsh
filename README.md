@@ -213,7 +213,6 @@ application's binary in Node mode, and prefers a real `node` when one exists.
 | `src/` | The plugin: host half (`host.ts`, `settings.ts`), browser half (`client/`), CLI (`cli.ts`), setup (`uv.ts`, `daemon-llm.ts`). |
 | `vendor/coding-agents/` | The coding-agent memory runtime, carried in-tree and inlined at build time. |
 | `scripts/` | Build, runtime pinning, and the packaging contract checks. |
-| `preview/` | The settings page's before/after screenshots and comparison page. |
 
 ## Development
 

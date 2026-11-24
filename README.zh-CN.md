@@ -167,7 +167,6 @@ hindsight · dsh memory
 | `src/` | 插件本体：宿主半（`host.ts`、`settings.ts`）、浏览器半（`client/`）、CLI（`cli.ts`）、初始化（`uv.ts`、`daemon-llm.ts`）。 |
 | `vendor/coding-agents/` | coding-agent 记忆运行时，随树携带，构建时内联。 |
 | `scripts/` | 构建、运行时钉住、打包契约检查。 |
-| `preview/` | 设置页改版前后的截图与对比页。 |
 
 ## 开发
 
